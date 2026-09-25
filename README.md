@@ -1,5 +1,7 @@
 # RtxSlop
 
+![Rasterization, ray tracing, path tracing, hybrid and SDF ray marching side by side](comparison.png)
+
 An interactive C# / Direct3D 12 demo that renders the same scene in five ways. You can switch between them live:
 
 | Key | Stage | What it shows |
@@ -34,12 +36,12 @@ The shaders are compiled at startup with DXC, which the NuGet package ships. You
 | `W A S D` / arrows | Walk |
 | `Space`/`E`, `C`/`Q` | Up / down |
 | `Shift` | Move fast |
-| `1`–`5` / `Tab` | Render mode |
+| `1`ï¿½`5` / `Tab` | Render mode |
 | `L` | Pause or resume the lights (paused + path tracing = converges to a clean reference) |
 | `B` / `N` | Fewer / more bounces (all modes except raster) |
 | `+` / `-` | Path tracer samples per pixel |
 | `F` | Denoiser on / off |
-| `M` | Anti-aliasing on / off (MSAA in raster, 4× SSAA in RT and SDF; SDF defaults to off because it costs ~5×) |
+| `M` | Anti-aliasing on / off (MSAA in raster, 4ï¿½ SSAA in RT and SDF; SDF defaults to off because it costs ~5ï¿½) |
 | `[` / `]` | Exposure |
 | `V` | VSync |
 | `F5` | Reload shaders |
