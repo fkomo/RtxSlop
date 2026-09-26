@@ -66,7 +66,7 @@ public sealed unsafe class Renderer : IDisposable
 
     // static scene data
     ID3D12Resource vb, ib, matBuf, sdfBuf;
-    ID3D12Resource blasStatic, blasSphere, blasMesh, tlas, tlasScratch;
+    ID3D12Resource blasStatic, blasGlass, blasSphere, blasMesh, tlas, tlasScratch;
     GpuTexture meshSdf;
     Vector3 meshSdfMin, meshSdfMax;
     readonly List<(int Index, Material Material)> pendingMaterials = new();
@@ -308,7 +308,9 @@ public sealed unsafe class Renderer : IDisposable
         }
 
         cl.ResourceBarrierUnorderedAccessView(null);
-        blasStatic = BuildBlas("BLAS static", 0, scene.StaticIndexCount);
+        blasStatic = BuildBlas("BLAS static", 0, scene.GlassFirstIndex);
+        if (scene.StaticIndexCount > scene.GlassFirstIndex)
+            blasGlass = BuildBlas("BLAS static glass", scene.GlassFirstIndex, scene.StaticIndexCount - scene.GlassFirstIndex);
         blasSphere = BuildBlas("BLAS light sphere", scene.SphereFirstIndex, scene.SphereIndexCount);
         if (scene.HasMesh)
             blasMesh = BuildBlas("BLAS mesh", scene.MeshFirstIndex, scene.MeshIndexCount);
@@ -341,7 +343,7 @@ public sealed unsafe class Renderer : IDisposable
         foreach (var u in uploads) u.Dispose();
     }
 
-    int TlasInstanceCount => 1 + scene.Lights.Length + (scene.HasMesh ? 1 : 0);
+    int TlasInstanceCount => 1 + scene.Lights.Length + (scene.HasMesh ? 1 : 0) + (blasGlass != null ? 1 : 0);
 
     // ---------------------------------------------------------------------------------------------
     // SDF mode: bake the mesh into a 3D signed distance texture (SdfBake.hlsl), once at startup
@@ -808,6 +810,7 @@ public sealed unsafe class Renderer : IDisposable
             ShadowIndex = SlotShadow, ProbeIndex = SlotProbe, StaticIndexCount = (uint)scene.StaticIndexCount,
             ProbePos = scene.ProbePositions[0], ShadowNear = ShadowNear, ShadowFar = ShadowFar,
             MeshFirstIndex = (uint)scene.MeshFirstIndex,
+            GlassFirstIndex = (uint)scene.GlassFirstIndex,
             MeshMaterial = scene.HasMesh ? (uint)scene.MeshMaterialIndex : 0xFFFFFFFFu,
             MeshSdfIndex = SlotMeshSdf, MeshSdfMin = meshSdfMin, MeshSdfMax = meshSdfMax,
         };
@@ -962,7 +965,7 @@ public sealed unsafe class Renderer : IDisposable
     void RenderRaster(UploadRing ring, Camera camera, Matrix4x4 view, Matrix4x4 proj, ulong mainPass, bool msaa)
     {
         var noClip = new Vector4(0, 0, 0, 1);
-        bool meshGlass = scene.MeshIsGlass;
+        var glassObjects = scene.Objects.Where(scene.IsGlass).ToList();
 
         // 1) omnidirectional shadow maps: 6 faces per light
         Transition(shadowMap, ResourceStates.DepthWrite);
@@ -977,8 +980,8 @@ public sealed unsafe class Renderer : IDisposable
                 cl.OMSetRenderTargets(0, (CpuDescriptorHandle*)null, false, dsv);
                 cl.ClearDepthStencilView(dsv, ClearFlags.Depth, 1, 0);
                 cl.SetGraphicsRootConstantBufferView(2, ring.Push(new PassData { ViewProj = CubeFaceViewProj(lp, f, ShadowNear, ShadowFar), CamPos = lp, ClipPlane = noClip }));
-                // mirrors hug the walls (nothing behind them to shadow); a glass mesh lets the light through
-                DrawScene(o => o.MirrorIndex < 0 && !(o.IsMesh && meshGlass), false);
+                // mirrors hug the walls (nothing behind them to shadow); glass lets the light through
+                DrawScene(o => o.MirrorIndex < 0 && !scene.IsGlass(o), false);
             }
         }
         Transition(shadowMap, ResourceStates.AllShaderResource);
@@ -1041,10 +1044,10 @@ public sealed unsafe class Renderer : IDisposable
         cl.ClearRenderTargetView(color.Rtv, new Color4(0, 0, 0, 1));
         cl.ClearDepthStencilView(dsvMain, ClearFlags.Depth, 1, 0);
         cl.SetGraphicsRootConstantBufferView(2, mainPass);
-        DrawScene(o => !(o.IsMesh && meshGlass), true);
+        DrawScene(o => !scene.IsGlass(o), true);
 
         // 5) glass: needs the finished opaque image to refract, so copy it and draw the mesh on top
-        if (meshGlass)
+        if (glassObjects.Count > 0)
         {
             if (msaa) ResolveMsaa();
             Transition(hdr, ResourceStates.CopySource);
@@ -1054,9 +1057,11 @@ public sealed unsafe class Renderer : IDisposable
             Transition(color, ResourceStates.RenderTarget);
             cl.OMSetRenderTargets(color.Rtv, dsvMain);
             cl.SetPipelineState(msaa ? psoGlassMsaa : psoGlass);
-            var mesh = scene.Objects.First(o => o.IsMesh);
-            RootConstants(false, (uint)mesh.FirstIndex, 0xFFFFFFFF, SlotSceneColor);
-            cl.DrawInstanced((uint)mesh.IndexCount, 1, 0, 0);
+            foreach (var o in glassObjects)
+            {
+                RootConstants(false, (uint)o.FirstIndex, 0xFFFFFFFF, SlotSceneColor);
+                cl.DrawInstanced((uint)o.IndexCount, 1, 0, 0);
+            }
         }
         if (msaa) ResolveMsaa();
     }
@@ -1083,8 +1088,11 @@ public sealed unsafe class Renderer : IDisposable
             var m = Matrix4x4.CreateScale(L.Radius) * Matrix4x4.CreateTranslation(L.Pos);
             inst[1 + i] = InstanceDesc.Create(m, (uint)(1 + i), 0x02, blasSphere.GPUVirtualAddress);
         }
+        int next = 1 + scene.Lights.Length;
         if (scene.HasMesh)
-            inst[1 + scene.Lights.Length] = InstanceDesc.Create(Matrix4x4.Identity, 100, 0x04, blasMesh.GPUVirtualAddress);   // INSTANCE_MESH, MASK_MESH
+            inst[next++] = InstanceDesc.Create(Matrix4x4.Identity, 100, 0x04, blasMesh.GPUVirtualAddress);    // INSTANCE_MESH, MASK_MESH
+        if (blasGlass != null)
+            inst[next++] = InstanceDesc.Create(Matrix4x4.Identity, 101, 0x08, blasGlass.GPUVirtualAddress);   // INSTANCE_GLASS, MASK_GLASS
         tlasInputs.InstanceDescriptions = a.Gpu;
         cl.BuildRaytracingAccelerationStructure(new BuildRaytracingAccelerationStructureDescription
         {
@@ -1241,7 +1249,7 @@ public sealed unsafe class Renderer : IDisposable
         WaitIdle();
         ReleaseSizeDependent();
         DisposePipelines();
-        foreach (var d in new IDisposable[] { shadowMap, probes[0], probes[1], probeDepth, hud, meshSdf, vb, ib, matBuf, sdfBuf, blasStatic, blasSphere, blasMesh, tlas, tlasScratch, queryHeap, queryReadback })
+        foreach (var d in new IDisposable[] { shadowMap, probes[0], probes[1], probeDepth, hud, meshSdf, vb, ib, matBuf, sdfBuf, blasStatic, blasGlass, blasSphere, blasMesh, tlas, tlasScratch, queryHeap, queryReadback })
             d?.Dispose();
         foreach (var r in rings) r.Dispose();
         foreach (var a in allocators) a.Dispose();

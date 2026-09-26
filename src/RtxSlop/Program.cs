@@ -21,7 +21,7 @@ static class Program
         catch (Exception ex)
         {
             File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "error.log"), ex.ToString());
-            if (!args.Contains("--capture"))
+            if (!args.Contains("--capture") && !args.Contains("--bench"))
                 MessageBox.Show(ex.ToString(), "RtxSlop - fatal error", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
@@ -35,7 +35,7 @@ sealed class MainForm : Form
     readonly RenderSettings settings = new();
     readonly HashSet<Keys> keys = new();
     readonly string shaderDir = Path.Combine(AppContext.BaseDirectory, "Shaders");
-    readonly string captureDir;
+    readonly string captureDir, benchDir;
 
     bool mouseCaptured;
     readonly string modelInfo;
@@ -62,6 +62,8 @@ sealed class MainForm : Form
         bool debug = args.Contains("--debug");
         int ci = Array.IndexOf(args, "--capture");
         if (ci >= 0) captureDir = ci + 1 < args.Length ? args[ci + 1] : "captures";
+        int bi = Array.IndexOf(args, "--bench");
+        if (bi >= 0) benchDir = bi + 1 < args.Length ? args[bi + 1] : ".";
 
         // polygon model: --model <file.obj>, else data/dragon/dragon.obj found above the exe; --no-model disables it
         ObjMesh mesh = null;
@@ -100,6 +102,14 @@ sealed class MainForm : Form
     public void Run()
     {
         Show();
+        if (benchDir != null)
+        {
+            showHud = false;
+            renderer.SetHud(DrawHud());
+            Directory.CreateDirectory(benchDir);
+            File.WriteAllText(Path.Combine(benchDir, "bench.txt"), MeasureTimings(allPresets: true));
+            return;
+        }
         if (captureDir != null)
         {
             RunCaptureScript();
@@ -319,6 +329,29 @@ sealed class MainForm : Form
     // ---------------------------------------------------------------------------------------------
     // --capture <dir>: render fixed viewpoints in every mode and save PNGs (used for testing)
     // ---------------------------------------------------------------------------------------------
+    /// <summary>GPU time of every mode from the front view with moving lights (optionally for every model material).</summary>
+    string MeasureTimings(bool allPresets)
+    {
+        camera.Position = new Vector3(0, 1.7f, -4.6f); camera.Yaw = 0; camera.Pitch = -0.05f;
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"{renderer.AdapterName}, {renderer.Width}x{renderer.Height}" + (scene.HasMesh ? $", model: {modelInfo}" : ""));
+        int presets = allPresets && scene.HasMesh ? scene.MeshPresets.Length : 1;
+        for (int p = 0; p < presets; p++)
+        {
+            if (p > 0) CycleMeshMaterial();
+            if (scene.HasMesh) sb.AppendLine($"-- model material: {scene.MeshPresets[scene.MeshPreset].Name}");
+            foreach (RenderMode mode in Enum.GetValues<RenderMode>())
+            {
+                settings.Mode = mode;
+                settings.LightsAnimating = true;
+                for (int i = 0; i < 120; i++) { lightTime += 1f / 120; scene.UpdateLights(lightTime); renderer.Render(camera, settings, lightTime); }
+                sb.AppendLine($"{mode,-10} {renderer.GpuTimeMs,7:F2} ms");
+            }
+        }
+        if (presets > 1) CycleMeshMaterial();   // back to where we started
+        return sb.ToString();
+    }
+
     void RunCaptureScript()
     {
         var views = new (string Name, Vector3 Pos, float Yaw, float Pitch)[]
@@ -398,22 +431,7 @@ sealed class MainForm : Form
         renderer.RequestCapture(Path.Combine(captureDir, "front_2_PathTrace_1spp_denoised.png"));
         renderer.Render(camera, settings, lightTime);
 
-        // timing sample
-        var sb = new System.Text.StringBuilder();
-        foreach (RenderMode mode in Enum.GetValues<RenderMode>())
-        {
-            settings.Mode = mode;
-            settings.LightsAnimating = true;
-            for (int i = 0; i < 120; i++) { lightTime += 1f / 120; scene.UpdateLights(lightTime); renderer.Render(camera, settings, lightTime); }
-            sb.AppendLine($"{mode}: gpu {renderer.GpuTimeMs:F2} ms @ {renderer.Width}x{renderer.Height}");
-        }
-        settings.Mode = RenderMode.Sdf;
-        settings.SdfAntiAliasing = true;
-        for (int i = 0; i < 120; i++) { lightTime += 1f / 120; scene.UpdateLights(lightTime); renderer.Render(camera, settings, lightTime); }
-        sb.AppendLine($"Sdf (4x SSAA): gpu {renderer.GpuTimeMs:F2} ms");
-        settings.SdfAntiAliasing = false;
-        if (scene.HasMesh) sb.AppendLine($"model: {modelInfo}, material {scene.MeshPresets[scene.MeshPreset].Name}");
-        File.WriteAllText(Path.Combine(captureDir, "timings.txt"), sb.ToString());
+        File.WriteAllText(Path.Combine(captureDir, "timings.txt"), MeasureTimings(allPresets: false));
 
         // resize path: swap chain + every size dependent target is recreated
         ClientSize = new Size(1280, 720);

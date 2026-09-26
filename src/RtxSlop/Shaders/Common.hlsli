@@ -40,7 +40,7 @@ cbuffer FrameCB : register(b1)
     uint gVbIndex;         uint gIbIndex;      uint gMatIndex;  uint gTlasIndex;
     uint gShadowIndex;     uint gProbeIndex;   uint gStaticIndexCount; uint gMeshFirstIndex;
     float3 gProbePos;      float gShadowNear;
-    float gShadowFar;      uint gMeshMaterial;  uint gMeshSdfIndex; uint gPad1;   // gMeshMaterial = NO_MESH without a model
+    float gShadowFar;      uint gMeshMaterial;  uint gMeshSdfIndex; uint gGlassFirstIndex;   // gMeshMaterial = NO_MESH without a model
     float3 gMeshSdfMin;    float gPad2;
     float3 gMeshSdfMax;    float gPad3;
 };
@@ -233,9 +233,13 @@ float3 CameraRayDir(float2 pixel)
 #define MASK_GEOMETRY 0x01
 #define MASK_LIGHTS   0x02
 #define MASK_MESH     0x04
+#define MASK_GLASS    0x08   // static glass objects
+#define MASK_SOLID    (MASK_GEOMETRY | MASK_MESH | MASK_GLASS)
 
-// TLAS instance ids: 0 = static room, 1..3 = light bulbs, INSTANCE_MESH = the loaded .obj model
+// TLAS instance ids: 0 = static room, 1..3 = light bulbs, INSTANCE_MESH = the loaded .obj model,
+// INSTANCE_GLASS = static glass objects (own BLAS so shadow rays can treat them separately)
 #define INSTANCE_MESH 100u
+#define INSTANCE_GLASS 101u
 #define NO_MESH 0xFFFFFFFFu
 
 bool IsLightInstance(uint id) { return id >= 1 && id < INSTANCE_MESH; }
@@ -249,11 +253,11 @@ struct Hit
     float t;
 };
 
-Hit TraceClosest(float3 o, float3 d, uint mask)
+Hit TraceClosest(float3 o, float3 d, uint mask, float tMax = 1e30)
 {
     RaytracingAccelerationStructure tlas = ResourceDescriptorHeap[gTlasIndex];
     RayDesc ray;
-    ray.Origin = o; ray.Direction = d; ray.TMin = 0.0; ray.TMax = 1e30;
+    ray.Origin = o; ray.Direction = d; ray.TMin = 0.0; ray.TMax = tMax;
     RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
     q.TraceRayInline(tlas, RAY_FLAG_NONE, mask, ray);
     q.Proceed();
@@ -266,7 +270,7 @@ Hit TraceClosest(float3 o, float3 d, uint mask)
     return h;
 }
 
-bool TraceVisible(float3 o, float3 d, float tMax, uint mask = MASK_GEOMETRY | MASK_MESH)
+bool TraceVisible(float3 o, float3 d, float tMax, uint mask = MASK_SOLID)
 {
     RaytracingAccelerationStructure tlas = ResourceDescriptorHeap[gTlasIndex];
     RayDesc ray;
@@ -275,18 +279,6 @@ bool TraceVisible(float3 o, float3 d, float tMax, uint mask = MASK_GEOMETRY | MA
     q.TraceRayInline(tlas, RAY_FLAG_NONE, mask, ray);
     q.Proceed();
     return q.CommittedStatus() == COMMITTED_NOTHING;
-}
-
-bool MeshIsGlass() { return gMeshMaterial != NO_MESH && LoadMaterial(gMeshMaterial).type == MAT_GLASS; }
-
-// Shadow rays for the Whitted-style modes: a glass model lets (tinted, dimmed) light through instead of
-// casting a black shadow - the usual "transparent shadow" cheat. The path tracer doesn't use this.
-float3 ShadowTransmittance(float3 o, float3 d, float tMax)
-{
-    if (!MeshIsGlass()) return TraceVisible(o, d, tMax) ? 1 : 0;
-    if (!TraceVisible(o, d, tMax, MASK_GEOMETRY)) return 0;
-    if (TraceVisible(o, d, tMax, MASK_MESH)) return 1;
-    return LoadMaterial(gMeshMaterial).albedo * 0.65;
 }
 
 struct Surface
@@ -301,7 +293,7 @@ Surface GetSurface(Hit h, float3 o, float3 d)
 {
     StructuredBuffer<Vertex> vb = ResourceDescriptorHeap[gVbIndex];
     StructuredBuffer<uint> ib = ResourceDescriptorHeap[gIbIndex];
-    uint base = (h.instance == INSTANCE_MESH ? gMeshFirstIndex : 0) + h.prim * 3;
+    uint base = (h.instance == INSTANCE_MESH ? gMeshFirstIndex : h.instance == INSTANCE_GLASS ? gGlassFirstIndex : 0) + h.prim * 3;
     Vertex v0 = vb[ib[base + 0]];
     Vertex v1 = vb[ib[base + 1]];
     Vertex v2 = vb[ib[base + 2]];
@@ -316,6 +308,24 @@ Surface GetSurface(Hit h, float3 o, float3 d)
 }
 
 float3 OffsetRay(float3 p, float3 n) { return p + n * 1e-3; }
+
+// Shadow rays for the Whitted-style ray tracer: glass lets (tinted, dimmed) light through instead of
+// casting a black shadow - the usual "transparent shadow" cheat. Glass lives in separate instances
+// (static glass: MASK_GLASS, the model when its material is glass: MASK_MESH), so this is 1-3 cheap
+// queries instead of walking through every glass surface.
+// The path tracer doesn't use this (glass is a delta BSDF there; light through it arrives as caustics).
+bool MeshIsGlass() { return gMeshMaterial != NO_MESH && LoadMaterial(gMeshMaterial).type == MAT_GLASS; }
+
+float3 ShadowTransmittance(float3 o, float3 d, float tMax)
+{
+    bool meshGlass = MeshIsGlass();
+    if (!TraceVisible(o, d, tMax, MASK_GEOMETRY | (meshGlass ? 0 : MASK_MESH))) return 0;
+    float3 T = 1;
+    Hit g = TraceClosest(o, d, MASK_GLASS, tMax);
+    if (g.hit) T *= LoadMaterial(GetSurface(g, o, d).material).albedo * 0.65;
+    if (meshGlass && !TraceVisible(o, d, tMax, MASK_MESH)) T *= LoadMaterial(gMeshMaterial).albedo * 0.65;
+    return T;
+}
 
 // ---------------------------------------------------------------------------------------------
 // Dielectrics (glass)
