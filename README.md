@@ -12,7 +12,7 @@ An interactive C# / Direct3D 12 demo that renders the same scene in five ways. Y
 | `4` | **Hybrid** | How RTX games do it: primary visibility is rasterized into a G-buffer (position, normal, material), and the path tracer starts from that surface instead of tracing camera rays. Everything after the first hit is traced exactly as in mode 3 |
 | `5` | **SDF ray marching** | No triangles, rasterizer or RT cores: the room is ~20 analytic signed distance fields (half-spaces, rotated boxes, spheres), sphere traced in a compute shader. Soft shadows and ambient occlusion come from the distance field itself; mirror/metal reflections are marched too |
 
-The scene is a 12 × 4 × 12 m room with a Cornell-style red and green wall, a polished checkered floor, two mirrors that face each other, pillars and boxes that cast shadows, a chrome sphere and a gold sphere, and three moving colored sphere lights.
+The scene is a 12 × 4 × 12 m room with a Cornell-style red and green wall, a polished checkered floor, two mirrors that face each other, pillars and boxes that cast shadows, a chrome sphere, a gold sphere and a glass ball, and three moving colored sphere lights.
 
 ## Requirements
 
@@ -60,7 +60,7 @@ A Wavefront `.obj` model sits in the middle of the room. By default it is `data/
 | Path tracing / hybrid | Delta dielectric BSDF (caustics emerge naturally) | GGX, glossy |
 | SDF | Model baked at startup into a 128³-ish distance texture (GPU jump flooding, sign from ray queries); refraction marches the inside | Marched reflection |
 
-Command-line flags: `--debug` enables the D3D12 debug layer (it needs the Windows "Graphics Tools" optional feature). `--capture <dir>` renders fixed viewpoints in every mode, saves PNGs and timings, then exits.
+Command-line flags: `--debug` enables the D3D12 debug layer (it needs the Windows "Graphics Tools" optional feature). `--capture <dir>` renders fixed viewpoints in every mode, saves PNGs and timings, then exits. `--bench <dir>` only measures GPU time per mode and model material (`bench.txt`).
 
 ## Architecture
 

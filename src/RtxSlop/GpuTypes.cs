@@ -36,7 +36,7 @@ public struct FrameData
     public uint VbIndex, IbIndex, MatIndex, TlasIndex;
     public uint ShadowIndex, ProbeIndex, StaticIndexCount, MeshFirstIndex;
     public Vector3 ProbePos; public float ShadowNear;
-    public float ShadowFar; public uint MeshMaterial, MeshSdfIndex, Pad1;
+    public float ShadowFar; public uint MeshMaterial, MeshSdfIndex, GlassFirstIndex;
     public Vector3 MeshSdfMin; public float Pad2;
     public Vector3 MeshSdfMax; public float Pad3;
 }

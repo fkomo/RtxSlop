@@ -58,6 +58,7 @@ public sealed class SceneObject
     public int IndexCount;
     public int MirrorIndex = -1;     // >= 0 if this object is a planar mirror
     public int ProbeCenter = -1;     // >= 0: reflection probe captured from inside this object (it is skipped there)
+    public int Material = -1;        // material of the object's vertices
     public bool IsMesh;              // the loaded .obj model
 }
 
@@ -85,6 +86,7 @@ public sealed class Scene
     public int SdfPlaneCount;   // the same room as signed distance fields
 
     public int StaticIndexCount;
+    public int GlassFirstIndex;      // [GlassFirstIndex, StaticIndexCount) = static glass objects
     public int SphereFirstIndex, SphereIndexCount;
     public readonly Vector3[] ProbePositions = new Vector3[2];   // 0 = chrome sphere, 1 = mesh
 
@@ -98,7 +100,7 @@ public sealed class Scene
     public const float HalfX = 6f, HalfZ = 6f, Height = 4f;
 
     // Material indices
-    int mFloor, mWhite, mRed, mGreen, mCeiling, mFrame, mStone, mBlue, mOrange, mChrome, mGold;
+    int mFloor, mWhite, mRed, mGreen, mCeiling, mFrame, mStone, mBlue, mOrange, mChrome, mGold, mGlass;
 
     public Scene(Func<int, uint> mirrorTextureSlot, Func<int, uint> probeSlot, ObjMesh mesh)
     {
@@ -113,6 +115,8 @@ public sealed class Scene
         mOrange = AddMaterial(new Vector3(0.9f, 0.4f, 0.05f), 0.5f, 0);
         mChrome = AddMaterial(new Vector3(0.95f, 0.95f, 0.95f), 0.02f, 1, flags: Material.FlagProbe, tex: probeSlot(0));
         mGold = AddMaterial(new Vector3(1.0f, 0.78f, 0.34f), 0.25f, 1, flags: Material.FlagProbe, tex: probeSlot(0));
+        mGlass = AddMaterial(new Vector3(0.92f, 0.97f, 1.0f), 0, 0, Material.Glass, tex: probeSlot(0));
+        Materials[mGlass] = Materials[mGlass] with { Ior = 1.5f };
         MeshPresets = new (string, Material)[]
         {
             ("jade", new Material { Albedo = new Vector3(0.18f, 0.55f, 0.36f), Roughness = 0.45f }),
@@ -166,6 +170,10 @@ public sealed class Scene
         AddSphere(ProbePositions[0], 0.9f, mChrome, 64, 32); End();
         Begin("GoldSphere"); AddSphere(new(-1.5f, 0.6f, -2.5f), 0.6f, mGold, 48, 24); End();
 
+        // static glass goes last: it gets its own BLAS/instance so shadow rays can treat it separately
+        GlassFirstIndex = Indices.Count;
+        Begin("GlassSphere"); AddSphere(new(3.2f, 0.7f, 1.5f), 0.7f, mGlass, 64, 32); End();
+
         StaticIndexCount = Indices.Count;
 
         ProbePositions[1] = new Vector3(0, 1.0f, 0);
@@ -207,6 +215,7 @@ public sealed class Scene
 
         var obj = Begin("Mesh");
         obj.IsMesh = true;
+        obj.Material = MeshMaterialIndex;
         obj.ProbeCenter = 1;
         MeshFirstIndex = Indices.Count;
         foreach (int i in mesh.Indices) Indices.Add(baseV + (uint)i);
@@ -234,7 +243,7 @@ public sealed class Scene
         return Materials[MeshMaterialIndex];
     }
 
-    public bool MeshIsGlass => HasMesh && Materials[MeshMaterialIndex].Type == Material.Glass;
+    public bool IsGlass(SceneObject o) => o.Material >= 0 && Materials[o.Material].Type == Material.Glass;
 
     public void UpdateLights(float t)
     {
@@ -317,6 +326,7 @@ public sealed class Scene
     uint AddVertex(Vector3 p, Vector3 n, int mat)
     {
         Vertices.Add(new Vertex { Pos = p, Normal = n, Material = (uint)mat });
+        if (current != null) current.Material = mat;
         return (uint)(Vertices.Count - 1);
     }
 
