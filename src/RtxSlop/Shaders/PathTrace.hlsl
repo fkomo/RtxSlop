@@ -3,6 +3,7 @@
 //  - next event estimation towards the sphere lights (uniform cone sampling -> soft shadows)
 //  - multiple importance sampling (power heuristic) between light and BSDF sampling
 //  - Russian roulette
+//  - smooth glass (Fresnel reflect/refract, Beer-Lambert absorption) - caustics emerge naturally
 //  - writes albedo-demodulated radiance + "primary surface replacement" guides for the denoiser
 //    (for mirror pixels the guides describe the surface seen *in* the mirror, like in Portal RTX)
 // Root constants: rc0 = radiance UAV, rc1 = guide UAV (normal.xyz, virtual distance), rc2 = albedo UAV,
@@ -140,7 +141,7 @@ SceneHit Intersect(float3 o, float3 d)
     SceneHit r = (SceneHit)0;
     r.hit = h.hit;
     r.t = h.t;
-    r.isLight = h.hit && h.instance > 0;
+    r.isLight = h.hit && IsLightInstance(h.instance);
     r.light = h.instance - 1;
     if (h.hit && !r.isLight) r.s = GetSurface(h, o, d);
     return r;
@@ -164,6 +165,7 @@ SceneHit FromGBuffer(uint2 id, out float3 dir)
     r.s.pos = p.xyz;
     r.s.N = n.xyz;
     r.s.material = code;
+    r.s.front = true;   // the camera is outside
     return r;
 }
 
@@ -210,7 +212,18 @@ void CS_PathTrace(uint2 id : SV_DispatchThreadID)
             float3 albedo = MaterialAlbedo(m, s.pos);
             guideN = s.N;
             guideAlbedo = tint * albedo;
-            if (!IsGuideMirror(m) || k == 3) break;
+            bool glass = m.type == MAT_GLASS;
+            if (!(IsGuideMirror(m) || glass) || k == 3) break;
+            if (glass)
+            {
+                // see through glass along the dominant (refracted) direction
+                float eta = s.front ? 1.0 / m.ior : m.ior;
+                float F = FresnelDielectric(saturate(dot(s.N, -d)), eta);
+                float3 T = refract(d, s.N, eta);
+                if (F < 1.0) { tint *= (1.0 - F) * albedo; o = s.pos - s.N * 1e-3; d = T; }
+                else { o = OffsetRay(s.pos, s.N); d = reflect(d, s.N); }
+                continue;
+            }
             tint *= F_Schlick(SpecularF0(albedo, m.metallic), saturate(dot(s.N, -d)));
             o = OffsetRay(s.pos, s.N);
             d = reflect(d, s.N);
@@ -259,6 +272,21 @@ void CS_PathTrace(uint2 id : SV_DispatchThreadID)
             float3 albedo = MaterialAlbedo(m, s.pos);
             float3 V = -d;
             float3 P = OffsetRay(s.pos, s.N);
+
+            if (m.type == MAT_GLASS)
+            {
+                // smooth dielectric (delta BSDF): pick reflection or refraction with probability F,
+                // which makes the Fresnel weights cancel. No NEE through delta lobes.
+                if (!s.front) throughput *= GlassAbsorption(albedo, h.t);
+                if (depth == gMaxBounces) break;
+                float eta = s.front ? 1.0 / m.ior : m.ior;
+                float F = FresnelDielectric(saturate(dot(s.N, V)), eta);
+                if (Rand(seed) < F) { o = P; d = reflect(d, s.N); }
+                else { o = s.pos - s.N * 1e-3; d = refract(d, s.N, eta); }
+                prevPdf = 1e8;   // delta: light hits after this get full MIS weight
+                prevPos = o;
+                continue;
+            }
 
             // Next event estimation with MIS
             float alpha = RoughnessToAlpha(m.roughness);

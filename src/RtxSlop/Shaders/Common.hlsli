@@ -38,9 +38,11 @@ cbuffer FrameCB : register(b1)
     float3 gAmbient;       float gExposure;
     Light gLights[4];
     uint gVbIndex;         uint gIbIndex;      uint gMatIndex;  uint gTlasIndex;
-    uint gShadowIndex;     uint gProbeIndex;   uint gStaticIndexCount; uint gPad0;
+    uint gShadowIndex;     uint gProbeIndex;   uint gStaticIndexCount; uint gMeshFirstIndex;
     float3 gProbePos;      float gShadowNear;
-    float gShadowFar;      float3 gPad1;
+    float gShadowFar;      uint gMeshMaterial;  uint gMeshSdfIndex; uint gPad1;   // gMeshMaterial = NO_MESH without a model
+    float3 gMeshSdfMin;    float gPad2;
+    float3 gMeshSdfMax;    float gPad3;
 };
 
 cbuffer PassCB : register(b2)
@@ -71,12 +73,13 @@ struct Material
 {
     float3 albedo;   float roughness;
     float3 emission; float metallic;
-    uint type;       uint texIndex;  uint flags;  uint pad;
+    uint type;       uint texIndex;  uint flags;  float ior;
 };
 
 #define MAT_STANDARD 0u
 #define MAT_CHECKER  1u
 #define MAT_MIRROR   2u
+#define MAT_GLASS    3u   // smooth dielectric: albedo = transmittance after 1 m (Beer-Lambert), ior
 #define MATF_PROBE   1u
 
 Material LoadMaterial(uint id)
@@ -229,6 +232,13 @@ float3 CameraRayDir(float2 pixel)
 // ---------------------------------------------------------------------------------------------
 #define MASK_GEOMETRY 0x01
 #define MASK_LIGHTS   0x02
+#define MASK_MESH     0x04
+
+// TLAS instance ids: 0 = static room, 1..3 = light bulbs, INSTANCE_MESH = the loaded .obj model
+#define INSTANCE_MESH 100u
+#define NO_MESH 0xFFFFFFFFu
+
+bool IsLightInstance(uint id) { return id >= 1 && id < INSTANCE_MESH; }
 
 struct Hit
 {
@@ -256,15 +266,27 @@ Hit TraceClosest(float3 o, float3 d, uint mask)
     return h;
 }
 
-bool TraceVisible(float3 o, float3 d, float tMax)
+bool TraceVisible(float3 o, float3 d, float tMax, uint mask = MASK_GEOMETRY | MASK_MESH)
 {
     RaytracingAccelerationStructure tlas = ResourceDescriptorHeap[gTlasIndex];
     RayDesc ray;
     ray.Origin = o; ray.Direction = d; ray.TMin = 0.0; ray.TMax = tMax;
     RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
-    q.TraceRayInline(tlas, RAY_FLAG_NONE, MASK_GEOMETRY, ray);
+    q.TraceRayInline(tlas, RAY_FLAG_NONE, mask, ray);
     q.Proceed();
     return q.CommittedStatus() == COMMITTED_NOTHING;
+}
+
+bool MeshIsGlass() { return gMeshMaterial != NO_MESH && LoadMaterial(gMeshMaterial).type == MAT_GLASS; }
+
+// Shadow rays for the Whitted-style modes: a glass model lets (tinted, dimmed) light through instead of
+// casting a black shadow - the usual "transparent shadow" cheat. The path tracer doesn't use this.
+float3 ShadowTransmittance(float3 o, float3 d, float tMax)
+{
+    if (!MeshIsGlass()) return TraceVisible(o, d, tMax) ? 1 : 0;
+    if (!TraceVisible(o, d, tMax, MASK_GEOMETRY)) return 0;
+    if (TraceVisible(o, d, tMax, MASK_MESH)) return 1;
+    return LoadMaterial(gMeshMaterial).albedo * 0.65;
 }
 
 struct Surface
@@ -272,13 +294,14 @@ struct Surface
     float3 pos;
     float3 N;     // shading normal, facing the incoming ray
     uint material;
+    bool front;   // ray hit the outside of the surface (entering glass)
 };
 
 Surface GetSurface(Hit h, float3 o, float3 d)
 {
     StructuredBuffer<Vertex> vb = ResourceDescriptorHeap[gVbIndex];
     StructuredBuffer<uint> ib = ResourceDescriptorHeap[gIbIndex];
-    uint base = h.prim * 3;
+    uint base = (h.instance == INSTANCE_MESH ? gMeshFirstIndex : 0) + h.prim * 3;
     Vertex v0 = vb[ib[base + 0]];
     Vertex v1 = vb[ib[base + 1]];
     Vertex v2 = vb[ib[base + 2]];
@@ -286,9 +309,27 @@ Surface GetSurface(Hit h, float3 o, float3 d)
     Surface s;
     s.pos = v0.pos * w.x + v1.pos * w.y + v2.pos * w.z;
     float3 n = normalize(v0.normal * w.x + v1.normal * w.y + v2.normal * w.z);
-    s.N = dot(n, d) > 0 ? -n : n;
+    s.front = dot(n, d) < 0;
+    s.N = s.front ? n : -n;
     s.material = v0.material;
     return s;
 }
 
 float3 OffsetRay(float3 p, float3 n) { return p + n * 1e-3; }
+
+// ---------------------------------------------------------------------------------------------
+// Dielectrics (glass)
+// ---------------------------------------------------------------------------------------------
+// Exact unpolarized Fresnel reflectance. eta = n_incident / n_transmitted, cosI = dot(N, V) > 0.
+float FresnelDielectric(float cosI, float eta)
+{
+    float sin2T = eta * eta * (1.0 - cosI * cosI);
+    if (sin2T >= 1.0) return 1.0;   // total internal reflection
+    float cosT = sqrt(1.0 - sin2T);
+    float rs = (eta * cosI - cosT) / (eta * cosI + cosT);
+    float rp = (cosI - eta * cosT) / (cosI + eta * cosT);
+    return 0.5 * (rs * rs + rp * rp);
+}
+
+// Beer-Lambert absorption over a path of length t inside the glass (albedo = color after 1 m).
+float3 GlassAbsorption(float3 albedo, float t) { return pow(max(albedo, 1e-3), t); }

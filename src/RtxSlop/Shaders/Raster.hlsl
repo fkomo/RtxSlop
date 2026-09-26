@@ -3,7 +3,9 @@
 //  - omnidirectional shadow maps (cube map array, hardware PCF + Poisson disk)
 //  - planar reflections for mirrors (scene re-rendered through a mirrored camera)
 //  - dynamic cube-map reflection probe for the metal spheres
-// Root constants: rc0 = first index in the index buffer, rc1 = light index (NO_LIGHT for static geometry)
+//  - screen-space refraction for glass (PS_Glass, drawn after the opaque scene)
+// Root constants: rc0 = first index in the index buffer, rc1 = light index (NO_LIGHT for static geometry),
+//                 rc2 = (PS_Glass) SRV of the opaque scene color
 
 #include "Common.hlsli"
 
@@ -99,6 +101,7 @@ float4 PS_Main(VSOut i) : SV_Target
     float3 N = normalize(i.nrm);
     float3 V = normalize(gPassCamPos - i.wpos);
     float3 albedo = MaterialAlbedo(m, i.wpos);
+    if (m.type == MAT_GLASS) albedo *= 0.05;   // secondary passes (probe, mirrors): glass as dark glossy glass
 
     bool hasRefl = false;
     float3 refl = 0;
@@ -110,7 +113,7 @@ float4 PS_Main(VSOut i) : SV_Target
     }
     else if ((m.flags & MATF_PROBE) != 0 && (gPassFlags & PASS_NO_PROBE) == 0)
     {
-        TextureCube<float4> probe = ResourceDescriptorHeap[gProbeIndex];
+        TextureCube<float4> probe = ResourceDescriptorHeap[m.texIndex];   // each material names its probe
         float3 R = reflect(-V, N);
         refl = probe.SampleLevel(sLinear, R, 0).rgb;
         hasRefl = true;
@@ -154,4 +157,38 @@ GBufferOut PS_GBuffer(VSOut i)
     o.pos = float4(i.wpos, 1);
     o.nrmMat = float4(N, i.light != NO_LIGHT ? GBUF_LIGHT_CODE + i.light : (float)i.mat);
     return o;
+}
+
+// Glass in the rasterizer: there is no second surface or real refraction, so fake it -
+// bend the view ray, pretend it travels ~35 cm through the glass and look up the already rendered
+// opaque scene there (screen-space refraction), mix with the probe reflection by Fresnel.
+[RootSignature(RS)]
+float4 PS_Glass(VSOut i) : SV_Target
+{
+    Material m = LoadMaterial(i.mat);
+    float3 N = normalize(i.nrm);
+    float3 V = normalize(gPassCamPos - i.wpos);
+    if (dot(N, V) < 0) N = -N;
+    float eta = 1.0 / m.ior;
+    float F = FresnelDielectric(saturate(dot(N, V)), eta);
+
+    const float thickness = 0.35;
+    float3 T = refract(-V, N, eta);
+    float4 clip = mul(float4(i.wpos + T * thickness, 1), gPassViewProj);
+    float2 uv = saturate(clip.xy / clip.w * float2(0.5, -0.5) + 0.5);
+    Texture2D<float4> sceneColor = ResourceDescriptorHeap[rc2];
+    float3 refr = sceneColor.SampleLevel(sLinear, uv, 0).rgb * GlassAbsorption(m.albedo, 2.0 * thickness);
+
+    TextureCube<float4> probe = ResourceDescriptorHeap[m.texIndex];
+    float3 refl = probe.SampleLevel(sLinear, reflect(-V, N), 0).rgb;
+
+    // sharp highlights of the bulbs (specular only)
+    Material spec = m;
+    spec.roughness = 0.05;
+    spec.metallic = 0;
+    float3 highlights = 0;
+    for (uint li = 0; li < gNumLights; li++)
+        highlights += ShadePointLight(li, i.wpos, N, V, float3(0, 0, 0), spec, true);
+
+    return float4(lerp(refr, refl, F) + highlights, 1);
 }

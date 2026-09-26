@@ -38,6 +38,7 @@ The shaders are compiled at startup with DXC, which the NuGet package ships. You
 | `Shift` | Move fast |
 | `1`�`5` / `Tab` | Render mode |
 | `L` | Pause or resume the lights (paused + path tracing = converges to a clean reference) |
+| `G` | Cycle the model's material: jade (diffuse), glass, gold, mirror |
 | `B` / `N` | Fewer / more bounces (all modes except raster) |
 | `+` / `-` | Path tracer samples per pixel |
 | `F` | Denoiser on / off |
@@ -47,6 +48,17 @@ The shaders are compiled at startup with DXC, which the NuGet package ships. You
 | `F5` | Reload shaders |
 | `F12` | Screenshot (saved to `screenshots/` next to the exe) |
 | `H` | Hide the HUD |
+
+## Polygon models
+
+A Wavefront `.obj` model sits in the middle of the room. By default it is `data/dragon/dragon.obj` (the Stanford dragon, 871k triangles), found by searching upward from the exe; use `--model <file.obj>` to pick another or `--no-model` to leave it out. The loader (`ObjLoader.cs`) reads positions and faces (polygons, negative indices, `v/vt/vn` forms), fixes winding and handedness, and computes smooth normals. The model is scaled to fit the room and gets its own BLAS/TLAS instance. Each mode renders it its own way:
+
+| Mode | Glass | Gold / mirror |
+|---|---|---|
+| Raster | Screen-space refraction of the opaque scene + probe reflection | Second dynamic cube-map probe at the model |
+| Ray tracing | Whitted reflection + refraction ray tree, Beer absorption, tinted shadow rays | Traced mirror reflection |
+| Path tracing / hybrid | Delta dielectric BSDF (caustics emerge naturally) | GGX, glossy |
+| SDF | Model baked at startup into a 128³-ish distance texture (GPU jump flooding, sign from ray queries); refraction marches the inside | Marched reflection |
 
 Command-line flags: `--debug` enables the D3D12 debug layer (it needs the Windows "Graphics Tools" optional feature). `--capture <dir>` renders fixed viewpoints in every mode, saves PNGs and timings, then exits.
 

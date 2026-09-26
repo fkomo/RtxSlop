@@ -34,9 +34,11 @@ public struct FrameData
     public Vector3 Ambient; public float Exposure;
     public LightData Light0, Light1, Light2, Light3;
     public uint VbIndex, IbIndex, MatIndex, TlasIndex;
-    public uint ShadowIndex, ProbeIndex, StaticIndexCount, Pad0;
+    public uint ShadowIndex, ProbeIndex, StaticIndexCount, MeshFirstIndex;
     public Vector3 ProbePos; public float ShadowNear;
-    public float ShadowFar; public float Pad1, Pad2, Pad3;
+    public float ShadowFar; public uint MeshMaterial, MeshSdfIndex, Pad1;
+    public Vector3 MeshSdfMin; public float Pad2;
+    public Vector3 MeshSdfMax; public float Pad3;
 }
 
 /// <summary>Layout must match PassCB in Common.hlsli.</summary>

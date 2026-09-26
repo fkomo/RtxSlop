@@ -38,6 +38,7 @@ sealed class MainForm : Form
     readonly string captureDir;
 
     bool mouseCaptured;
+    readonly string modelInfo;
     bool resizePending;
     bool showHud = true;
     float lightTime = 3f;
@@ -62,10 +63,38 @@ sealed class MainForm : Form
         int ci = Array.IndexOf(args, "--capture");
         if (ci >= 0) captureDir = ci + 1 < args.Length ? args[ci + 1] : "captures";
 
-        scene = new Scene(i => (uint)(Renderer.SlotRefl0 + i));
+        // polygon model: --model <file.obj>, else data/dragon/dragon.obj found above the exe; --no-model disables it
+        ObjMesh mesh = null;
+        int mi = Array.IndexOf(args, "--model");
+        string modelPath = mi >= 0 && mi + 1 < args.Length ? args[mi + 1] : FindDataFile(Path.Combine("data", "dragon", "dragon.obj"));
+        if (!args.Contains("--no-model") && modelPath != null && File.Exists(modelPath))
+        {
+            var sw = Stopwatch.StartNew();
+            mesh = ObjLoader.Load(modelPath);
+            modelInfo = $"{Path.GetFileNameWithoutExtension(modelPath)} {mesh.Indices.Length / 3000}k tris ({sw.ElapsedMilliseconds} ms load)";
+        }
+
+        scene = new Scene(i => (uint)(Renderer.SlotRefl0 + i), Renderer.ProbeSlot, mesh);
         CreateHandle();
         renderer = new Renderer(Handle, ClientSize.Width, ClientSize.Height, scene, shaderDir, debug);
         Text = $"RtxSlop - {renderer.AdapterName}";
+    }
+
+    static string FindDataFile(string relative)
+    {
+        for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir != null; dir = dir.Parent)
+        {
+            var candidate = Path.Combine(dir.FullName, relative);
+            if (File.Exists(candidate)) return candidate;
+        }
+        return null;
+    }
+
+    void CycleMeshMaterial()
+    {
+        if (!scene.HasMesh) return;
+        var m = scene.SetMeshPreset(scene.MeshPreset + 1);
+        renderer.SetMaterial(scene.MeshMaterialIndex, m);
     }
 
     public void Run()
@@ -158,6 +187,7 @@ sealed class MainForm : Form
             case Keys.D5: case Keys.NumPad5: settings.Mode = RenderMode.Sdf; break;
             case Keys.Tab: settings.Mode = (RenderMode)(((int)settings.Mode + 1) % 5); break;
             case Keys.L: settings.LightsAnimating = !settings.LightsAnimating; break;
+            case Keys.G: CycleMeshMaterial(); break;
             case Keys.F: settings.Denoise = !settings.Denoise; break;
             case Keys.V: settings.VSync = !settings.VSync; break;
             case Keys.M:
@@ -268,9 +298,12 @@ sealed class MainForm : Form
                 };
                 g.DrawString(detail, hudFont, Brushes.Gainsboro, 10, y); y += 18;
                 g.DrawString($"{fps,6:F0} fps   cpu {cpuMs,5:F2} ms   gpu {renderer.GpuTimeMs,6:F2} ms   {renderer.Width}x{renderer.Height}", hudFont, Brushes.White, 10, y); y += 18;
-                g.DrawString($"lights {(settings.LightsAnimating ? "moving" : "paused")} (L)   exposure {settings.Exposure:F2} ([ ])   vsync {(settings.VSync ? "on" : "off")} (V)", hudFont, Brushes.Gainsboro, 10, y); y += 22;
+                g.DrawString($"lights {(settings.LightsAnimating ? "moving" : "paused")} (L)   exposure {settings.Exposure:F2} ([ ])   vsync {(settings.VSync ? "on" : "off")} (V)", hudFont, Brushes.Gainsboro, 10, y); y += 18;
+                if (scene.HasMesh)
+                    g.DrawString($"model {modelInfo}   material {scene.MeshPresets[scene.MeshPreset].Name} (G)", hudFont, Brushes.Gainsboro, 10, y);
+                y += 22;
                 g.DrawString("click: mouse look   WASD move   Space/C up/down   Shift fast", hudFont, Brushes.DarkGray, 10, y); y += 18;
-                g.DrawString("1/2/3 or Tab: mode   F5 reload shaders   F12 screenshot   H hide", hudFont, Brushes.DarkGray, 10, y); y += 18;
+                g.DrawString("1-5 or Tab: mode   F5 reload shaders   F12 screenshot   H hide", hudFont, Brushes.DarkGray, 10, y); y += 18;
                 if (clock.Elapsed.TotalSeconds < statusUntil)
                     g.DrawString(statusMessage, hudFont, Brushes.Yellow, 10, y);
             }
@@ -313,6 +346,29 @@ sealed class MainForm : Form
                 }
             }
         }
+        // the model up close in every material, in the main modes
+        if (scene.HasMesh)
+        {
+            camera.Position = new Vector3(0, 1.5f, -3.4f); camera.Yaw = 0; camera.Pitch = -0.15f;
+            for (int preset = 0; preset < scene.MeshPresets.Length; preset++)
+            {
+                if (preset > 0) CycleMeshMaterial();
+                foreach (var mode in new[] { RenderMode.Raster, RenderMode.RayTrace, RenderMode.PathTrace, RenderMode.Sdf })
+                {
+                    settings.Mode = mode;
+                    int frames = mode == RenderMode.PathTrace ? 256 : 3;
+                    for (int i = 0; i < frames; i++)
+                    {
+                        Application.DoEvents();
+                        if (i == frames - 1) renderer.RequestCapture(Path.Combine(captureDir, $"model_{scene.MeshPresets[scene.MeshPreset].Name}_{(int)mode}_{mode}.png"));
+                        renderer.Render(camera, settings, lightTime);
+                    }
+                }
+            }
+            CycleMeshMaterial();   // back to the first preset
+            while (scene.MeshPreset != 1) CycleMeshMaterial();
+        }
+
         // PT with moving lights (short history) - what you normally see interactively
         settings.Mode = RenderMode.PathTrace;
         camera.Position = views[0].Pos; camera.Yaw = views[0].Yaw; camera.Pitch = views[0].Pitch;
@@ -356,6 +412,7 @@ sealed class MainForm : Form
         for (int i = 0; i < 120; i++) { lightTime += 1f / 120; scene.UpdateLights(lightTime); renderer.Render(camera, settings, lightTime); }
         sb.AppendLine($"Sdf (4x SSAA): gpu {renderer.GpuTimeMs:F2} ms");
         settings.SdfAntiAliasing = false;
+        if (scene.HasMesh) sb.AppendLine($"model: {modelInfo}, material {scene.MeshPresets[scene.MeshPreset].Name}");
         File.WriteAllText(Path.Combine(captureDir, "timings.txt"), sb.ToString());
 
         // resize path: swap chain + every size dependent target is recreated

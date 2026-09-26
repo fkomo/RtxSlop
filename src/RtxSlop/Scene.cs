@@ -22,9 +22,9 @@ public struct Material
     public uint Type;
     public uint TexIndex;
     public uint Flags;
-    public uint Pad;
+    public float Ior;        // glass only
 
-    public const uint Standard = 0, Checker = 1, Mirror = 2;
+    public const uint Standard = 0, Checker = 1, Mirror = 2, Glass = 3;
     public const uint FlagProbe = 1;
 }
 
@@ -48,7 +48,7 @@ public struct SdfPrim
     public float CosR, SinR; // box rotation around Y
     public Vector2 Pad;
 
-    public const uint Plane = 0, Box = 1, Sphere = 2;
+    public const uint Plane = 0, Box = 1, Sphere = 2, Mesh = 3;   // Mesh: baked 3D distance texture, Size = half extents
 }
 
 public sealed class SceneObject
@@ -57,7 +57,8 @@ public sealed class SceneObject
     public int FirstIndex;
     public int IndexCount;
     public int MirrorIndex = -1;     // >= 0 if this object is a planar mirror
-    public bool IsProbeCenter;       // the chrome sphere the reflection probe is captured from
+    public int ProbeCenter = -1;     // >= 0: reflection probe captured from inside this object (it is skipped there)
+    public bool IsMesh;              // the loaded .obj model
 }
 
 public sealed class Mirror
@@ -85,14 +86,21 @@ public sealed class Scene
 
     public int StaticIndexCount;
     public int SphereFirstIndex, SphereIndexCount;
-    public Vector3 ProbePos;
+    public readonly Vector3[] ProbePositions = new Vector3[2];   // 0 = chrome sphere, 1 = mesh
+
+    // loaded .obj model (index range after the static geometry, own BLAS / instance)
+    public bool HasMesh;
+    public int MeshFirstIndex, MeshIndexCount, MeshMaterialIndex = -1;
+    public Vector3 MeshMin, MeshMax;
+    public int MeshPreset;
+    public (string Name, Material Material)[] MeshPresets;
 
     public const float HalfX = 6f, HalfZ = 6f, Height = 4f;
 
     // Material indices
     int mFloor, mWhite, mRed, mGreen, mCeiling, mFrame, mStone, mBlue, mOrange, mChrome, mGold;
 
-    public Scene(Func<int, uint> mirrorTextureSlot)
+    public Scene(Func<int, uint> mirrorTextureSlot, Func<int, uint> probeSlot, ObjMesh mesh)
     {
         mFloor = AddMaterial(new Vector3(0.85f, 0.85f, 0.82f), 0.08f, 0, Material.Checker);
         mWhite = AddMaterial(new Vector3(0.75f, 0.75f, 0.72f), 0.9f, 0);
@@ -103,8 +111,15 @@ public sealed class Scene
         mStone = AddMaterial(new Vector3(0.6f, 0.58f, 0.55f), 0.8f, 0);
         mBlue = AddMaterial(new Vector3(0.08f, 0.2f, 0.65f), 0.35f, 0);
         mOrange = AddMaterial(new Vector3(0.9f, 0.4f, 0.05f), 0.5f, 0);
-        mChrome = AddMaterial(new Vector3(0.95f, 0.95f, 0.95f), 0.02f, 1, flags: Material.FlagProbe);
-        mGold = AddMaterial(new Vector3(1.0f, 0.78f, 0.34f), 0.25f, 1, flags: Material.FlagProbe);
+        mChrome = AddMaterial(new Vector3(0.95f, 0.95f, 0.95f), 0.02f, 1, flags: Material.FlagProbe, tex: probeSlot(0));
+        mGold = AddMaterial(new Vector3(1.0f, 0.78f, 0.34f), 0.25f, 1, flags: Material.FlagProbe, tex: probeSlot(0));
+        MeshPresets = new (string, Material)[]
+        {
+            ("jade", new Material { Albedo = new Vector3(0.18f, 0.55f, 0.36f), Roughness = 0.45f }),
+            ("glass", new Material { Albedo = new Vector3(0.88f, 0.97f, 0.93f), Roughness = 0, Type = Material.Glass, Ior = 1.5f, TexIndex = probeSlot(1) }),
+            ("gold", new Material { Albedo = new Vector3(1.0f, 0.78f, 0.34f), Roughness = 0.2f, Metallic = 1, Flags = Material.FlagProbe, TexIndex = probeSlot(1) }),
+            ("mirror", new Material { Albedo = new Vector3(0.95f, 0.95f, 0.95f), Roughness = 0.01f, Metallic = 1, Flags = Material.FlagProbe, TexIndex = probeSlot(1) }),
+        };
 
         // ---- room shell (inward facing) ----
         // SDF version of the shell: 6 inward-facing half spaces (dot(p, n) + d)
@@ -146,12 +161,15 @@ public sealed class Scene
         Begin("LowWall"); AddBox(new(-2.5f, 0.5f, -4.0f), new(1.25f, 0.5f, 0.15f), 0, mWhite); End();
         Begin("PillarRight"); AddBox(new(4.6f, 1.0f, 2.6f), new(0.25f, 1.0f, 0.25f), 45, mStone); End();
 
-        ProbePos = new Vector3(1.5f, 0.9f, 3.3f);
-        var chrome = Begin("ChromeSphere"); chrome.IsProbeCenter = true;
-        AddSphere(ProbePos, 0.9f, mChrome, 64, 32); End();
+        ProbePositions[0] = new Vector3(1.5f, 0.9f, 3.3f);
+        var chrome = Begin("ChromeSphere"); chrome.ProbeCenter = 0;
+        AddSphere(ProbePositions[0], 0.9f, mChrome, 64, 32); End();
         Begin("GoldSphere"); AddSphere(new(-1.5f, 0.6f, -2.5f), 0.6f, mGold, 48, 24); End();
 
         StaticIndexCount = Indices.Count;
+
+        ProbePositions[1] = new Vector3(0, 1.0f, 0);
+        if (mesh != null) AddMesh(mesh);
 
         // unit sphere used (instanced) for the light bulbs
         SphereFirstIndex = Indices.Count;
@@ -160,6 +178,63 @@ public sealed class Scene
 
         UpdateLights(0);
     }
+
+    /// <summary>
+    /// Places the model in the middle of the room: centered on the XZ origin, standing on the floor,
+    /// scaled so it fits inside the orbit of the low (blue) light and below the high ones.
+    /// </summary>
+    void AddMesh(ObjMesh mesh, float rotYDeg = 90)
+    {
+        // turn it so the camera sees it in profile
+        var rot = Matrix4x4.CreateRotationY(rotYDeg * MathF.PI / 180f);
+        var positions = mesh.Positions.Select(p => Vector3.Transform(p, rot)).ToArray();
+        var normals = mesh.Normals.Select(n => Vector3.TransformNormal(n, rot)).ToArray();
+        var bmin = positions.Aggregate(new Vector3(float.MaxValue), Vector3.Min);
+        var bmax = positions.Aggregate(new Vector3(float.MinValue), Vector3.Max);
+
+        var size = bmax - bmin;
+        float scale = MathF.Min(3.0f / MathF.Max(size.X, size.Z), 2.0f / size.Y);
+        var center = (bmin + bmax) * 0.5f;
+        var offset = new Vector3(-center.X * scale, -bmin.Y * scale, -center.Z * scale);
+
+        MeshPreset = 1;   // glass
+        MeshMaterialIndex = Materials.Count;
+        Materials.Add(MeshPresets[MeshPreset].Material);
+
+        uint baseV = (uint)Vertices.Count;
+        foreach (var (p, n) in positions.Zip(normals))
+            Vertices.Add(new Vertex { Pos = p * scale + offset, Normal = n, Material = (uint)MeshMaterialIndex });
+
+        var obj = Begin("Mesh");
+        obj.IsMesh = true;
+        obj.ProbeCenter = 1;
+        MeshFirstIndex = Indices.Count;
+        foreach (int i in mesh.Indices) Indices.Add(baseV + (uint)i);
+        MeshIndexCount = Indices.Count - MeshFirstIndex;
+        End();
+
+        MeshMin = bmin * scale + offset;
+        MeshMax = bmax * scale + offset;
+        ProbePositions[1] = new Vector3(0, (MeshMin.Y + MeshMax.Y) * 0.5f, 0);
+        HasMesh = true;
+
+        // SDF mode: a baked distance texture over the (padded) bounds
+        var pad = new Vector3(0.1f);
+        SdfPrims.Add(new SdfPrim
+        {
+            Type = SdfPrim.Mesh, Center = (MeshMin + MeshMax) * 0.5f, Size = (MeshMax - MeshMin) * 0.5f + pad,
+            Material = (uint)MeshMaterialIndex, CosR = 1,
+        });
+    }
+
+    public Material SetMeshPreset(int preset)
+    {
+        MeshPreset = ((preset % MeshPresets.Length) + MeshPresets.Length) % MeshPresets.Length;
+        Materials[MeshMaterialIndex] = MeshPresets[MeshPreset].Material;
+        return Materials[MeshMaterialIndex];
+    }
+
+    public bool MeshIsGlass => HasMesh && Materials[MeshMaterialIndex].Type == Material.Glass;
 
     public void UpdateLights(float t)
     {

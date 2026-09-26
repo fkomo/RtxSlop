@@ -2,36 +2,84 @@
 //  - primary visibility is ray traced
 //  - exact hard shadows: one shadow ray per light
 //  - recursive mirror reflections (mirror <-> mirror "infinite" corridor, chrome sphere, polished floor)
+//  - glass: Fresnel-weighted reflection + refraction rays, Beer-Lambert absorption, tinted shadows
 // Root constants: rc0 = output UAV (HDR), rc1 = rays per pixel (1 or 4, rotated grid SSAA)
 
 #include "Common.hlsli"
 
 // Mirrors, the polished floor and all metals get a (single, sharp) reflection ray.
-bool IsTracedReflective(Material m) { return m.roughness < 0.1 || m.metallic > 0.5; }
+bool IsTracedReflective(Material m) { return m.type != MAT_GLASS && (m.roughness < 0.1 || m.metallic > 0.5); }
+
+// Classic Whitted ray tree, flattened into a small explicit stack: glass spawns a reflection *and* a
+// refraction ray, mirrors/metals a reflection ray, weighted by Fresnel.
+struct RayTask
+{
+    float3 o;
+    float3 d;
+    float3 throughput;
+    uint depth;
+};
+
+#define MAX_STACK 8
+#define MAX_RAYS 32
 
 float3 TracePixel(float2 pixel)
 {
-    float3 o = gCamPos;
-    float3 d = CameraRayDir(pixel);
+    RayTask stack[MAX_STACK];
+    int sp = 0;
+    RayTask first;
+    first.o = gCamPos;
+    first.d = CameraRayDir(pixel);
+    first.throughput = 1;
+    first.depth = 0;
+    stack[sp++] = first;
     float3 radiance = 0;
-    float3 throughput = 1;
 
-    for (uint bounce = 0; bounce <= gMaxBounces; bounce++)
+    for (int n = 0; n < MAX_RAYS && sp > 0; n++)
     {
-        Hit h = TraceClosest(o, d, 0xFF);
-        if (!h.hit) break;
-        if (h.instance > 0)
+        RayTask r = stack[--sp];
+        Hit h = TraceClosest(r.o, r.d, 0xFF);
+        if (!h.hit) continue;
+        if (IsLightInstance(h.instance))
         {
-            radiance += throughput * LightEmission(h.instance - 1);
-            break;
+            radiance += r.throughput * LightEmission(h.instance - 1);
+            continue;
         }
 
-        Surface s = GetSurface(h, o, d);
+        Surface s = GetSurface(h, r.o, r.d);
         Material m = LoadMaterial(s.material);
         float3 albedo = MaterialAlbedo(m, s.pos);
-        float3 V = -d;
-        bool reflective = IsTracedReflective(m) && bounce < gMaxBounces;
+        float3 V = -r.d;
+        // glass gets extra depth: thin parts bounce light around inside a few times
+        bool canRecurse = r.depth < gMaxBounces + (m.type == MAT_GLASS ? 4u : 0u);
 
+        if (m.type == MAT_GLASS)
+        {
+            float3 thr = r.throughput;
+            if (!s.front) thr *= GlassAbsorption(albedo, h.t);   // this segment ran inside the glass
+            if (!canRecurse) continue;
+            float eta = s.front ? 1.0 / m.ior : m.ior;
+            float F = FresnelDielectric(saturate(dot(s.N, V)), eta);
+            RayTask t;
+            t.depth = r.depth + 1;
+            if (F < 1.0 && sp < MAX_STACK)
+            {
+                t.o = s.pos - s.N * 1e-3;
+                t.d = refract(r.d, s.N, eta);
+                t.throughput = thr * (1.0 - F);
+                stack[sp++] = t;
+            }
+            if (sp < MAX_STACK && max(thr.r, max(thr.g, thr.b)) * F > 0.01)
+            {
+                t.o = OffsetRay(s.pos, s.N);
+                t.d = reflect(r.d, s.N);
+                t.throughput = thr * F;
+                stack[sp++] = t;
+            }
+            continue;
+        }
+
+        bool reflective = IsTracedReflective(m) && canRecurse;
         float3 direct = 0;
         float3 P = OffsetRay(s.pos, s.N);
         for (uint li = 0; li < gNumLights; li++)
@@ -41,22 +89,24 @@ float3 TracePixel(float2 pixel)
             {
                 float3 Lv = gLights[li].pos - P;
                 float dist = length(Lv);
-                if (TraceVisible(P, Lv / dist, dist - gLights[li].radius))
-                    direct += c;
+                direct += c * ShadowTransmittance(P, Lv / dist, dist - gLights[li].radius);
             }
         }
         direct += gAmbient * albedo * (1.0 - m.metallic);
-        radiance += throughput * direct;
+        radiance += r.throughput * direct;
 
-        if (!reflective) break;
-
-        float3 F = F_Schlick(SpecularF0(albedo, m.metallic), saturate(dot(s.N, V)));
-        throughput *= F;
-        if (max(throughput.r, max(throughput.g, throughput.b)) < 0.01) break;
-        o = P;
-        d = reflect(d, s.N);
+        if (reflective && sp < MAX_STACK)
+        {
+            float3 F = F_Schlick(SpecularF0(albedo, m.metallic), saturate(dot(s.N, V)));
+            RayTask t;
+            t.o = P;
+            t.d = reflect(r.d, s.N);
+            t.throughput = r.throughput * F;
+            t.depth = r.depth + 1;
+            if (max(t.throughput.r, max(t.throughput.g, t.throughput.b)) > 0.01)
+                stack[sp++] = t;
+        }
     }
-
     return radiance;
 }
 
