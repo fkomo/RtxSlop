@@ -30,12 +30,22 @@ static class Program
 sealed class MainForm : Form
 {
     readonly Renderer renderer;
-    readonly Scene scene;
+    Scene scene;                          // the one being rendered
+    readonly Scene roomScene;
+    readonly Scene[] lazyScenes = new Scene[5];   // 1 = Crytek Sponza (F2), 2 = Dabrovic Sponza (F3), 3/4 = San Miguel low-poly / full (F4/F5), loaded on first use
+
+    // courtyard: the model stands in the free strip between the fountain and the trees (the .obj's z is mirrored),
+    // the camera looks across the café tables from the west door, the lights orbit over the whole courtyard
+    static readonly Scene.SiteLayout SanMiguelLayout = new(1.0f, new Vector3(15.75f, 0, -7.1f), new Vector3(7.0f, 2.4f, -7.0f),
+        MathF.PI / 2, -0.12f, 0, new Vector3(1.0f, 1.0f, 3.0f), 512);
+    readonly ObjMesh modelMesh;
+    readonly Dictionary<Scene, (Vector3 Pos, float Yaw, float Pitch)> savedCameras = new();
     readonly Camera camera = new();
     readonly RenderSettings settings = new();
     readonly HashSet<Keys> keys = new();
     readonly string shaderDir = Path.Combine(AppContext.BaseDirectory, "Shaders");
     readonly string captureDir, benchDir;
+    HashSet<int> captureScenes = new() { 0, 1, 2, 3, 4 };   // --scenes 1,3 limits the capture script
 
     bool mouseCaptured;
     readonly string modelInfo;
@@ -64,6 +74,8 @@ sealed class MainForm : Form
         if (ci >= 0) captureDir = ci + 1 < args.Length ? args[ci + 1] : "captures";
         int bi = Array.IndexOf(args, "--bench");
         if (bi >= 0) benchDir = bi + 1 < args.Length ? args[bi + 1] : ".";
+        int si = Array.IndexOf(args, "--scenes");
+        if (si >= 0 && si + 1 < args.Length) captureScenes = args[si + 1].Split(',').Select(int.Parse).ToHashSet();
 
         // polygon model: --model <file.obj>, else data/dragon/dragon.obj found above the exe; --no-model disables it
         ObjMesh mesh = null;
@@ -76,10 +88,13 @@ sealed class MainForm : Form
             modelInfo = $"{Path.GetFileNameWithoutExtension(modelPath)} {mesh.Indices.Length / 3000}k tris ({sw.ElapsedMilliseconds} ms load)";
         }
 
-        scene = new Scene(i => (uint)(Renderer.SlotRefl0 + i), Renderer.ProbeSlot, mesh);
+        modelMesh = mesh;
+        roomScene = scene = Scene.CreateRoom(i => (uint)(Renderer.SlotRefl0 + i), Renderer.ProbeSlot, mesh);
+        ResetCamera();
         CreateHandle();
         renderer = new Renderer(Handle, ClientSize.Width, ClientSize.Height, scene, shaderDir, debug);
         Text = $"RtxSlop - {renderer.AdapterName}";
+        if (args.Contains("--sponza")) SwitchScene(1);
     }
 
     static string FindDataFile(string relative)
@@ -90,6 +105,46 @@ sealed class MainForm : Form
             if (File.Exists(candidate)) return candidate;
         }
         return null;
+    }
+
+    void ResetCamera()
+    {
+        camera.Position = scene.CameraPos;
+        camera.Yaw = scene.CameraYaw;
+        camera.Pitch = scene.CameraPitch;
+    }
+
+    /// <summary>0 = the room, 1 = Crytek Sponza, 2 = Dabrovic Sponza (loaded, uploaded and baked the first time).</summary>
+    void SwitchScene(int which)
+    {
+        Scene target;
+        if (which == 0) target = roomScene;
+        else
+        {
+            if (lazyScenes[which] == null)
+            {
+                string file = which switch { 1 => "sponza2/sponza.obj", 2 => "sponza/sponza.obj", 3 => "san_miguel/san-miguel-low-poly.obj", _ => "san_miguel/san-miguel.obj" };
+                string path = FindDataFile(Path.Combine("data", file));
+                if (path == null) { Flash($"data/{file} not found"); return; }
+                Cursor.Current = Cursors.WaitCursor;
+                lazyScenes[which] = which switch
+                {
+                    1 => Scene.CreateSponza(path, Renderer.ProbeSlot, modelMesh),
+                    2 => Scene.CreateDabrovicSponza(path, Renderer.ProbeSlot, modelMesh),
+                    3 => Scene.CreateSanMiguel("san miguel", path, Renderer.ProbeSlot, modelMesh, SanMiguelLayout),
+                    _ => Scene.CreateSanMiguel("san miguel (full)", path, Renderer.ProbeSlot, modelMesh, SanMiguelLayout),
+                };
+            }
+            target = lazyScenes[which];
+        }
+        if (target == scene) return;
+        savedCameras[scene] = (camera.Position, camera.Yaw, camera.Pitch);
+        scene = target;
+        scene.UpdateLights(lightTime);
+        renderer.SetScene(scene);
+        if (savedCameras.TryGetValue(scene, out var c)) { camera.Position = c.Pos; camera.Yaw = c.Yaw; camera.Pitch = c.Pitch; }
+        else ResetCamera();
+        Cursor.Current = Cursors.Default;
     }
 
     void CycleMeshMaterial()
@@ -107,7 +162,16 @@ sealed class MainForm : Form
             showHud = false;
             renderer.SetHud(DrawHud());
             Directory.CreateDirectory(benchDir);
-            File.WriteAllText(Path.Combine(benchDir, "bench.txt"), MeasureTimings(allPresets: true));
+            string text = MeasureTimings(allPresets: true);
+            SwitchScene(1);
+            text += MeasureTimings(allPresets: true);
+            SwitchScene(2);
+            text += MeasureTimings(allPresets: true);
+            SwitchScene(3);
+            text += MeasureTimings(allPresets: true);
+            SwitchScene(4);
+            text += MeasureTimings(allPresets: true);
+            File.WriteAllText(Path.Combine(benchDir, "bench.txt"), text);
             return;
         }
         if (captureDir != null)
@@ -197,6 +261,12 @@ sealed class MainForm : Form
             case Keys.D5: case Keys.NumPad5: settings.Mode = RenderMode.Sdf; break;
             case Keys.Tab: settings.Mode = (RenderMode)(((int)settings.Mode + 1) % 5); break;
             case Keys.L: settings.LightsAnimating = !settings.LightsAnimating; break;
+            case Keys.K: settings.LightsOn = !settings.LightsOn; break;
+            case Keys.F1: SwitchScene(0); break;
+            case Keys.F2: SwitchScene(1); break;
+            case Keys.F3: SwitchScene(2); break;
+            case Keys.F4: SwitchScene(3); break;
+            case Keys.F5: SwitchScene(4); break;
             case Keys.G: CycleMeshMaterial(); break;
             case Keys.F: settings.Denoise = !settings.Denoise; break;
             case Keys.V: settings.VSync = !settings.VSync; break;
@@ -217,7 +287,7 @@ sealed class MainForm : Form
             case Keys.OemMinus: case Keys.Subtract: settings.Spp = Math.Max(1, settings.Spp / 2); break;
             case Keys.OemOpenBrackets: settings.Exposure = MathF.Max(0.05f, settings.Exposure / 1.25f); break;
             case Keys.OemCloseBrackets: settings.Exposure = MathF.Min(20f, settings.Exposure * 1.25f); break;
-            case Keys.F5:
+            case Keys.R:
                 try { renderer.ReloadShaders(shaderDir); Flash("Shaders reloaded"); }
                 catch (Exception ex) { Flash("Shader error - see shader-error.log"); File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "shader-error.log"), ex.Message); }
                 break;
@@ -258,7 +328,7 @@ sealed class MainForm : Form
         if (move != Vector3.Zero)
         {
             float speed = keys.Contains(Keys.ShiftKey) ? 6f : 2.5f;
-            camera.Move(Vector3.Normalize(move), dt, speed);
+            camera.Move(Vector3.Normalize(move), dt, speed, scene.BoundsMin, scene.BoundsMax);
         }
     }
 
@@ -308,12 +378,13 @@ sealed class MainForm : Form
                 };
                 g.DrawString(detail, hudFont, Brushes.Gainsboro, 10, y); y += 18;
                 g.DrawString($"{fps,6:F0} fps   cpu {cpuMs,5:F2} ms   gpu {renderer.GpuTimeMs,6:F2} ms   {renderer.Width}x{renderer.Height}", hudFont, Brushes.White, 10, y); y += 18;
-                g.DrawString($"lights {(settings.LightsAnimating ? "moving" : "paused")} (L)   exposure {settings.Exposure:F2} ([ ])   vsync {(settings.VSync ? "on" : "off")} (V)", hudFont, Brushes.Gainsboro, 10, y); y += 18;
+                g.DrawString($"scene {scene.Name} (F1-F5)   lights {(settings.LightsOn ? "on" : "OFF")} (K) {(settings.LightsAnimating ? "moving" : "paused")} (L)", hudFont, Brushes.Gainsboro, 10, y); y += 18;
+                g.DrawString($"exposure {settings.Exposure:F2} ([ ])   vsync {(settings.VSync ? "on" : "off")} (V)", hudFont, Brushes.Gainsboro, 10, y); y += 18;
                 if (scene.HasMesh)
                     g.DrawString($"model {modelInfo}   material {scene.MeshPresets[scene.MeshPreset].Name} (G)", hudFont, Brushes.Gainsboro, 10, y);
                 y += 22;
                 g.DrawString("click: mouse look   WASD move   Space/C up/down   Shift fast", hudFont, Brushes.DarkGray, 10, y); y += 18;
-                g.DrawString("1-5 or Tab: mode   F5 reload shaders   F12 screenshot   H hide", hudFont, Brushes.DarkGray, 10, y); y += 18;
+                g.DrawString("1-5 or Tab: mode   R reload shaders   F12 screenshot   H hide", hudFont, Brushes.DarkGray, 10, y); y += 18;
                 if (clock.Elapsed.TotalSeconds < statusUntil)
                     g.DrawString(statusMessage, hudFont, Brushes.Yellow, 10, y);
             }
@@ -329,12 +400,12 @@ sealed class MainForm : Form
     // ---------------------------------------------------------------------------------------------
     // --capture <dir>: render fixed viewpoints in every mode and save PNGs (used for testing)
     // ---------------------------------------------------------------------------------------------
-    /// <summary>GPU time of every mode from the front view with moving lights (optionally for every model material).</summary>
+    /// <summary>GPU time of every mode from the scene's start view with moving lights (optionally for every model material).</summary>
     string MeasureTimings(bool allPresets)
     {
-        camera.Position = new Vector3(0, 1.7f, -4.6f); camera.Yaw = 0; camera.Pitch = -0.05f;
+        ResetCamera();
         var sb = new System.Text.StringBuilder();
-        sb.AppendLine($"{renderer.AdapterName}, {renderer.Width}x{renderer.Height}" + (scene.HasMesh ? $", model: {modelInfo}" : ""));
+        sb.AppendLine($"== scene {scene.Name}: {renderer.AdapterName}, {renderer.Width}x{renderer.Height}" + (scene.HasMesh ? $", model: {modelInfo}" : ""));
         int presets = allPresets && scene.HasMesh ? scene.MeshPresets.Length : 1;
         for (int p = 0; p < presets; p++)
         {
@@ -364,6 +435,40 @@ sealed class MainForm : Form
         showHud = false;
         renderer.SetHud(DrawHud());
         scene.UpdateLights(lightTime);
+        string timings = "";
+        if (captureScenes.Contains(0)) timings = CaptureRoom(views);
+
+        // ---- scenes 2 and 3: the two Sponzas ----
+        foreach (var (index, prefix) in new[] { (1, "sponza"), (2, "dabrovic"), (3, "miguel"), (4, "miguelfull") })
+        {
+            if (!captureScenes.Contains(index)) continue;
+            var sw = Stopwatch.StartNew();
+            SwitchScene(index);
+            timings += $"{scene.Name} load + upload + bakes: {sw.ElapsedMilliseconds} ms\n";
+            CaptureSponza(prefix);
+            timings += MeasureTimings(allPresets: false);
+        }
+        SwitchScene(0);
+        File.WriteAllText(Path.Combine(captureDir, "timings.txt"), timings);
+        if (!captureScenes.Contains(0)) return;
+
+        // resize path: swap chain + every size dependent target is recreated
+        ClientSize = new Size(1280, 720);
+        Application.DoEvents();
+        renderer.Resize(ClientSize.Width, ClientSize.Height);
+        foreach (RenderMode mode in Enum.GetValues<RenderMode>())
+        {
+            settings.Mode = mode;
+            for (int i = 0; i < 8; i++)
+            {
+                if (i == 7) renderer.RequestCapture(Path.Combine(captureDir, $"resized_{(int)mode}_{mode}.png"));
+                renderer.Render(camera, settings, lightTime);
+            }
+        }
+    }
+
+    string CaptureRoom((string Name, Vector3 Pos, float Yaw, float Pitch)[] views)
+    {
         foreach (var v in views)
         {
             camera.Position = v.Pos; camera.Yaw = v.Yaw; camera.Pitch = v.Pitch;
@@ -431,21 +536,51 @@ sealed class MainForm : Form
         renderer.RequestCapture(Path.Combine(captureDir, "front_2_PathTrace_1spp_denoised.png"));
         renderer.Render(camera, settings, lightTime);
 
-        File.WriteAllText(Path.Combine(captureDir, "timings.txt"), MeasureTimings(allPresets: false));
+        return MeasureTimings(allPresets: false);
+    }
 
-        // resize path: swap chain + every size dependent target is recreated
-        ClientSize = new Size(1280, 720);
-        Application.DoEvents();
-        renderer.Resize(ClientSize.Width, ClientSize.Height);
-        foreach (RenderMode mode in Enum.GetValues<RenderMode>())
+    Vector3 ModelCenter() => (scene.MeshMin + scene.MeshMax) * 0.5f;
+
+    void CaptureSponza(string prefix)
+    {
+        settings.LightsAnimating = false;
+        scene.UpdateLights(lightTime);
+        var sponzaViews = new (string Name, Vector3 Pos, float Yaw, float Pitch)[]
         {
-            settings.Mode = mode;
-            for (int i = 0; i < 8; i++)
+            ($"{prefix}_atrium", scene.CameraPos, scene.CameraYaw, scene.CameraPitch),
+            ($"{prefix}_model", ModelCenter() + new Vector3(-5.5f, 0.5f, 0), MathF.PI / 2, -0.08f),
+            ($"{prefix}_high", ModelCenter() + new Vector3(-7.5f, 7.5f, 0), MathF.PI / 2, -0.55f),
+        };
+        // top-down overview (placement check)
+        camera.Position = ((scene.BoundsMin + scene.BoundsMax) * 0.5f) with { Y = scene.BoundsMax.Y + 25 };
+        camera.Yaw = 0; camera.Pitch = -1.5f;
+        settings.Mode = RenderMode.Raster;
+        for (int i = 0; i < 3; i++)
+        {
+            if (i == 2) renderer.RequestCapture(Path.Combine(captureDir, $"{prefix}_top_0_Raster.png"));
+            renderer.Render(camera, settings, lightTime);
+        }
+        foreach (var v in sponzaViews)
+        {
+            camera.Position = v.Pos; camera.Yaw = v.Yaw; camera.Pitch = v.Pitch;
+            foreach (bool lights in new[] { true, false })
             {
-                if (i == 7) renderer.RequestCapture(Path.Combine(captureDir, $"resized_{(int)mode}_{mode}.png"));
-                renderer.Render(camera, settings, lightTime);
+                if (!lights && !v.Name.EndsWith("_atrium")) continue;
+                settings.LightsOn = lights;
+                foreach (RenderMode mode in Enum.GetValues<RenderMode>())
+                {
+                    settings.Mode = mode;
+                    int frames = mode is RenderMode.PathTrace or RenderMode.Hybrid ? 256 : 3;
+                    for (int i = 0; i < frames; i++)
+                    {
+                        Application.DoEvents();
+                        if (i == frames - 1) renderer.RequestCapture(Path.Combine(captureDir, $"{v.Name}{(lights ? "" : "_lightsoff")}_{(int)mode}_{mode}.png"));
+                        renderer.Render(camera, settings, lightTime);
+                    }
+                }
             }
         }
+        settings.LightsOn = true;
     }
 
     protected override void Dispose(bool disposing)

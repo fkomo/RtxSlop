@@ -1,11 +1,12 @@
 // Stage 1: classic real-time rasterization.
-//  - forward PBR shading (GGX)
+//  - forward PBR shading (GGX), textured materials, alpha testing
 //  - omnidirectional shadow maps (cube map array, hardware PCF + Poisson disk)
 //  - planar reflections for mirrors (scene re-rendered through a mirrored camera)
-//  - dynamic cube-map reflection probe for the metal spheres
+//  - dynamic cube-map reflection probes for the metal spheres / the model
 //  - screen-space refraction for glass (PS_Glass, drawn after the opaque scene)
+//  - sky: fullscreen pass behind everything; ambient = sky light x baked per-vertex sky visibility
 // Root constants: rc0 = first index in the index buffer, rc1 = light index (NO_LIGHT for static geometry),
-//                 rc2 = (PS_Glass) SRV of the opaque scene color
+//                 rc2 = (PS_Glass) SRV of the opaque scene color; (PS_Sky) rc0/rc1 = viewport size
 
 #include "Common.hlsli"
 
@@ -14,6 +15,8 @@ struct VSOut
     float4 pos  : SV_Position;
     float3 wpos : WPOS;
     float3 nrm  : NORMAL;
+    float2 uv   : TEXCOORD0;
+    float skyVis : SKYVIS;
     nointerpolation uint mat   : MATERIAL;
     nointerpolation uint light : LIGHT;
     float clip  : SV_ClipDistance0;
@@ -41,6 +44,8 @@ VSOut VS_Main(uint vid : SV_VertexID)
     VSOut o;
     o.wpos = wp;
     o.nrm = v.normal;
+    o.uv = v.uv;
+    o.skyVis = v.skyVis;
     o.mat = v.material;
     o.light = rc1;
     o.pos = mul(float4(wp, 1), gPassViewProj);
@@ -48,12 +53,31 @@ VSOut VS_Main(uint vid : SV_VertexID)
     return o;
 }
 
-[RootSignature(RS)]
-float4 VS_Shadow(uint vid : SV_VertexID) : SV_Position
+void AlphaClip(Material m, float2 uv)
 {
-    float3 wp;
-    FetchVertex(vid, wp);
-    return mul(float4(wp, 1), gPassViewProj);
+    if ((m.flags & MATF_ALPHA_TEST) != 0 && m.alphaTex != NO_TEX)
+    {
+        Texture2D<float4> t = ResourceDescriptorHeap[m.alphaTex];
+        clip(MaskValue(m, t.Sample(sAniso, uv)) - 0.5);
+    }
+}
+
+float3 TexturedAlbedo(Material m, float3 wpos, float2 uv)
+{
+    float3 a = MaterialAlbedo(m, wpos);
+    if (m.albedoTex != NO_TEX)
+    {
+        Texture2D<float4> t = ResourceDescriptorHeap[m.albedoTex];
+        a *= t.Sample(sAniso, uv).rgb;
+    }
+    return a;
+}
+
+// Shadow maps: depth only, but alpha-tested geometry (foliage) must still cut holes.
+[RootSignature(RS)]
+void PS_ShadowClip(VSOut i)
+{
+    if (i.light == NO_LIGHT) AlphaClip(LoadMaterial(i.mat), i.uv);
 }
 
 static const float2 kPoisson[12] =
@@ -68,7 +92,8 @@ float ShadowFactor(uint li, float3 P, float3 N, float2 screenPos)
 {
     TextureCubeArray<float> sm = ResourceDescriptorHeap[gShadowIndex];
     Light Lt = gLights[li];
-    float3 d = (P + N * 0.015) - Lt.pos;
+    float3 toLight = Lt.pos - P;
+    float3 d = (P + N * 0.02 * sign(dot(N, toLight))) - Lt.pos;
     float3 ad = abs(d);
     float z = max(ad.x, max(ad.y, ad.z));
     float n = gShadowNear, f = gShadowFar;
@@ -98,9 +123,11 @@ float4 PS_Main(VSOut i) : SV_Target
         return float4(LightEmission(i.light), 1);
 
     Material m = LoadMaterial(i.mat);
+    AlphaClip(m, i.uv);
     float3 N = normalize(i.nrm);
     float3 V = normalize(gPassCamPos - i.wpos);
-    float3 albedo = MaterialAlbedo(m, i.wpos);
+    if (dot(N, V) < 0) N = -N;   // two-sided (foliage, single-sided architecture seen from behind)
+    float3 albedo = TexturedAlbedo(m, i.wpos, i.uv);
     if (m.type == MAT_GLASS) albedo *= 0.05;   // secondary passes (probe, mirrors): glass as dark glossy glass
 
     bool hasRefl = false;
@@ -127,7 +154,7 @@ float4 PS_Main(VSOut i) : SV_Target
             c *= ShadowFactor(li, i.wpos, N, i.pos.xy);
         color += c;
     }
-    color += gAmbient * albedo * (1.0 - m.metallic);
+    color += AmbientLight(N, i.skyVis) * albedo * (1.0 - m.metallic);
 
     if (hasRefl)
     {
@@ -138,24 +165,24 @@ float4 PS_Main(VSOut i) : SV_Target
 }
 
 // Hybrid mode: G-buffer for the path tracer (primary visibility is rasterized, everything else is traced).
-// RT0 = world position (w = 1 where covered), RT1 = normal + material code as float
-// (material index, or GBUF_LIGHT_CODE + bulb index; small integers are exact in fp32).
-#define GBUF_LIGHT_CODE 1024.0
-
+// RT0 = world position (w = 1 where covered), RT1 = normal + code: global triangle index (exact in fp32
+// up to 2^24), or -(bulb index + 1) for the light bulbs. The path tracer rebuilds the full surface
+// (uv, material, sky visibility) from the triangle.
 struct GBufferOut
 {
     float4 pos : SV_Target0;
-    float4 nrmMat : SV_Target1;
+    float4 nrmTri : SV_Target1;
 };
 
 [RootSignature(RS)]
-GBufferOut PS_GBuffer(VSOut i)
+GBufferOut PS_GBuffer(VSOut i, uint prim : SV_PrimitiveID)
 {
+    if (i.light == NO_LIGHT) AlphaClip(LoadMaterial(i.mat), i.uv);
     float3 N = normalize(i.nrm);
     if (dot(N, gPassCamPos - i.wpos) < 0) N = -N;
     GBufferOut o;
     o.pos = float4(i.wpos, 1);
-    o.nrmMat = float4(N, i.light != NO_LIGHT ? GBUF_LIGHT_CODE + i.light : (float)i.mat);
+    o.nrmTri = float4(N, i.light != NO_LIGHT ? -(float)(i.light + 1) : (float)(rc0 / 3 + prim));
     return o;
 }
 
@@ -191,4 +218,25 @@ float4 PS_Glass(VSOut i) : SV_Target
         highlights += ShadePointLight(li, i.wpos, N, V, float3(0, 0, 0), spec, true);
 
     return float4(lerp(refr, refl, F) + highlights, 1);
+}
+
+// Sky: a fullscreen triangle on the far plane, depth-tested (<=) against the scene so it only fills
+// the pixels nothing was drawn to.
+struct SkyOut { float4 pos : SV_Position; };
+
+[RootSignature(RS)]
+SkyOut VS_Sky(uint id : SV_VertexID)
+{
+    float2 uv = float2((id << 1) & 2, id & 2);
+    SkyOut o;
+    o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 1, 1);
+    return o;
+}
+
+[RootSignature(RS)]
+float4 PS_Sky(SkyOut i) : SV_Target
+{
+    float2 ndc = i.pos.xy / float2(rc0, rc1) * float2(2, -2) + float2(-1, 1);
+    float4 w = mul(float4(ndc, 1, 1), gPassInvViewProj);
+    return float4(SkyRadiance(normalize(w.xyz / w.w - gPassCamPos)), 1);
 }

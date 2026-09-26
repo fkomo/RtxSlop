@@ -1,6 +1,6 @@
 # RtxSlop
 
-![Rasterization, ray tracing, path tracing, hybrid and SDF ray marching side by side](comparison.png)
+![All five scenes: room, Crytek Sponza, Dabrovic Sponza, San Miguel (path traced) and the ray-traced mirror corridor](docs/images/hero.jpg)
 
 An interactive C# / Direct3D 12 demo that renders the same scene in five ways. You can switch between them live:
 
@@ -10,9 +10,45 @@ An interactive C# / Direct3D 12 demo that renders the same scene in five ways. Y
 | `2` | **Ray tracing** | DXR 1.1 inline ray queries: exact hard shadows, recursive mirror reflections (an infinite corridor between the two facing mirrors), and 4× supersampling |
 | `3` | **Path tracing** | GGX with VNDF importance sampling, next event estimation to sphere lights, MIS (power heuristic), Russian roulette, a temporal and à-trous (SVGF-style) denoiser, and primary-surface replacement for mirrors |
 | `4` | **Hybrid** | How RTX games do it: primary visibility is rasterized into a G-buffer (position, normal, material), and the path tracer starts from that surface instead of tracing camera rays. Everything after the first hit is traced exactly as in mode 3 |
-| `5` | **SDF ray marching** | No triangles, rasterizer or RT cores: the room is ~20 analytic signed distance fields (half-spaces, rotated boxes, spheres), sphere traced in a compute shader. Soft shadows and ambient occlusion come from the distance field itself; mirror/metal reflections are marched too |
+| `5` | **SDF ray marching** | No rasterizer or RT cores: the room is ~20 analytic signed distance fields (half-spaces, rotated boxes, spheres), and triangle meshes (the dragon, whole buildings) are baked into 3D distance grids, all sphere traced in a compute shader. Soft shadows and ambient occlusion come from the distance field itself; mirror/metal reflections are marched too |
 
-The scene is a 12 × 4 × 12 m room with a Cornell-style red and green wall, a polished checkered floor, two mirrors that face each other, pillars and boxes that cast shadows, a chrome sphere, a gold sphere and a glass ball, and three moving colored sphere lights.
+There are five scenes (`F1`–`F5`):
+
+1. **Room**: a 12 × 4 × 12 m procedural room with a Cornell-style red and green wall, a polished checkered floor, two mirrors that face each other, pillars and boxes that cast shadows, a chrome sphere, a gold sphere, a glass ball and the dragon.
+2. **Sponza (Crytek)**: a pure triangle mesh (`data/sponza2`, 262k triangles, 25 materials, 54 textures) with the dragon in the middle of the atrium. The roof is open, so it is lit by the sky too.
+3. **Sponza (Dabrovic)**: the same setup with Marko Dabrovic's original Sponza (`data/sponza`, 66k triangles, JPG textures). The file has no normals, so the loader generates them with a 45° crease angle: curved stone stays smooth and edges stay sharp.
+4. **San Miguel**: the San Miguel 2.1 courtyard (`data/san_miguel`, low-poly version: 5.6M triangles, 220 textures, lots of alpha-tested foliage) with the dragon between the fountain and the trees. The foliage masks live in the base color's alpha channel, and the one translucent material (`d < 1`) becomes glass.
+5. **San Miguel (full)**: the same courtyard from the full-detail `san-miguel.obj` (1.1 GB, 10M triangles). It looks nearly identical at normal viewing distances, but it shows how the modes scale: ray and path tracing cost about the same as with 5.6M triangles (BVH traversal is roughly logarithmic), while rasterization, which draws every triangle in every pass, gets about 60% slower.
+
+Every scene has three moving colored sphere lights. `K` switches them off; in the open-air scenes you then see only sky light.
+
+## Gallery
+
+All images are straight captures from the app (`--capture`) at 1600×900 on an RTX 4070.
+
+**The five modes, room.** Raster can only fake what the ray tracers compute: a single mirror bounce, a reflection probe for the spheres, screen-space refraction for the glass dragon.
+
+![The room in all five modes](docs/images/modes-room.jpg)
+
+**Crytek Sponza.** Textures, alpha-tested foliage and sky light through the open roof. Path tracing adds the bounce light that fills the arcades.
+
+![Crytek Sponza in all five modes](docs/images/modes-sponza.jpg)
+
+**Dabrovic Sponza.** Normals are generated at load (45° crease angle).
+
+![Dabrovic Sponza in all five modes](docs/images/modes-dabrovic.jpg)
+
+**San Miguel (5.6M triangles).** The SDF mode shows its limit here: at ~13 cm voxels, chairs and leaves become blobs.
+
+![San Miguel in all five modes](docs/images/modes-sanmiguel.jpg)
+
+**The model's materials** (`G`): jade, glass, gold and mirror in raster, ray tracing, path tracing and SDF.
+
+![Dragon materials across the modes](docs/images/materials.jpg)
+
+**Lights off (`K`).** Only the sky remains. Raster uses baked per-vertex sky visibility plus a small bounce term; the path tracer gets real multi-bounce sky light.
+
+![Lights on versus lights off](docs/images/lights-off.jpg)
 
 ## Requirements
 
@@ -25,7 +61,7 @@ The scene is a 12 × 4 × 12 m room with a Cornell-style red and green wall, a p
 dotnet run -c Release --project src/RtxSlop
 ```
 
-The shaders are compiled at startup with DXC, which the NuGet package ships. You can edit `src/RtxSlop/Shaders/*.hlsl` in the output folder and press `F5` to hot-reload them.
+The shaders are compiled at startup with DXC, which the NuGet package ships. You can edit `src/RtxSlop/Shaders/*.hlsl` in the output folder and press `R` to hot-reload them.
 
 ## Controls
 
@@ -36,16 +72,18 @@ The shaders are compiled at startup with DXC, which the NuGet package ships. You
 | `W A S D` / arrows | Walk |
 | `Space`/`E`, `C`/`Q` | Up / down |
 | `Shift` | Move fast |
-| `1`�`5` / `Tab` | Render mode |
+| `1`–`5` / `Tab` | Render mode |
 | `L` | Pause or resume the lights (paused + path tracing = converges to a clean reference) |
 | `G` | Cycle the model's material: jade (diffuse), glass, gold, mirror |
+| `F1`–`F5` | Scene: room / Crytek Sponza / Dabrovic Sponza / San Miguel / San Miguel full (loaded on first use; the very first San Miguel load parses the OBJ for 5–8 s, later loads use the cache) |
+| `K` | Lights on / off (off = sky light only) |
 | `B` / `N` | Fewer / more bounces (all modes except raster) |
 | `+` / `-` | Path tracer samples per pixel |
 | `F` | Denoiser on / off |
-| `M` | Anti-aliasing on / off (MSAA in raster, 4� SSAA in RT and SDF; SDF defaults to off because it costs ~5�) |
+| `M` | Anti-aliasing on / off (MSAA in raster, 4× SSAA in RT and SDF; SDF defaults to off because it costs ~5×) |
 | `[` / `]` | Exposure |
 | `V` | VSync |
-| `F5` | Reload shaders |
+| `R` | Reload shaders |
 | `F12` | Screenshot (saved to `screenshots/` next to the exe) |
 | `H` | Hide the HUD |
 
@@ -60,15 +98,26 @@ A Wavefront `.obj` model sits in the middle of the room. By default it is `data/
 | Path tracing / hybrid | Delta dielectric BSDF (caustics emerge naturally) | GGX, glossy |
 | SDF | Model baked at startup into a 128³-ish distance texture (GPU jump flooding, sign from ray queries); refraction marches the inside | Marched reflection |
 
-Command-line flags: `--debug` enables the D3D12 debug layer (it needs the Windows "Graphics Tools" optional feature). `--capture <dir>` renders fixed viewpoints in every mode, saves PNGs and timings, then exits. `--bench <dir>` only measures GPU time per mode and model material (`bench.txt`).
+## Scenes, textures and sky
+
+- **OBJ cache:** parsed meshes are cached next to the file (`*.obj.rtxcache`) and reused while the `.obj` is unchanged.
+- **OBJ + MTL:** faces, UVs, normals and per-face materials are read. Base color (`map_Kd`, sRGB) and alpha masks (`map_d`) are decoded on the CPU in parallel, get a mip chain and are uploaded once. Each scene keeps its own GPU resources (buffers, BLAS/TLAS, textures, SDF grids), so switching back is instant.
+- **Alpha testing:** raster uses `clip()`, including in the shadow maps. The ray tracers put foliage in a non-opaque BLAS geometry and alpha-test candidates in the `RayQuery` loop.
+- **Texture filtering in the ray tracers:** ray cones pick the mip level from the hit distance, the triangle's texel density and the angle of incidence.
+- **Sky:** a horizon-to-zenith gradient. The path tracer gets sky light (and its bounces) for free. For the other modes, the sky visibility of every vertex is baked once on the GPU with ray queries (64 rays per vertex) and used as ambient occlusion, plus a small constant for light bounced around the building.
+- **SDF mode in Sponza:** the whole building is baked into one *unsigned* distance grid of about 10 cm voxels, since open architecture has no inside. The bake also stores the nearest triangle per voxel, so SDF hits are shaded with the exact triangle's UV, normal, material and sky visibility. Visibility is still voxel-coarse, which shows on foliage.
+
+Command-line flags: `--sponza` starts in Sponza. `--debug` enables the D3D12 debug layer (it needs the Windows "Graphics Tools" optional feature). `--capture <dir>` renders fixed viewpoints in every mode, saves PNGs and timings, then exits. `--bench <dir>` only measures GPU time per scene, mode and model material (`bench.txt`). `--capture <dir> --scenes 1,3` limits the capture to some scenes (0 = room ... 4 = San Miguel full).
 
 ## Architecture
 
 ```
 src/RtxSlop/
   Program.cs     window, FPS input, HUD (GDI+ text -> texture), capture script
-  Renderer.cs    D3D12 device/swap chain, bindless heap, BLAS/TLAS, all passes
-  Scene.cs       procedural geometry (triangles + matching SDF primitives), materials, light animation
+  Renderer.cs    D3D12 device/swap chain, pipelines, all passes of the five modes
+  RendererScene.cs  per-scene GPU data: buffers, textures, BLAS/TLAS, SDF + sky-visibility bakes
+  Scene.cs       the two scenes: room (procedural) and Sponza (OBJ/MTL), materials, light animation
+  ObjLoader.cs   OBJ/MTL reader
   Camera.cs      first-person camera (left-handed, +Y up)
   GpuTypes.cs    constant-buffer layouts, DXR instance desc, upload ring
   Shaders/

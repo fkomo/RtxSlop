@@ -4,10 +4,14 @@
 //                     (pass 0: InterlockedMin of the distance, pass 1: the winner writes its point)
 //  3. CS_SdfJfa       3D jump flooding spreads the closest seed points to every voxel (log2 N passes)
 //  4. CS_SdfFinalize  distance = |voxel - seed|, sign from inline ray queries against the mesh BLAS
-//                     (hitting a back face first means the voxel is inside)
+//                     (hitting a back face first means the voxel is inside) - only for closed solids
+//                     (gBakeFlags bit 0); open architecture gets an unsigned field. Also writes the
+//                     nearest triangle per voxel, so SDF hits can be shaded with exact triangle data.
+// Seeds: xyz = closest surface point, w = bit-cast (global triangle index + 1), 0 = no seed yet.
 // FrameCB supplies the mesh buffers (gVbIndex, gIbIndex, gMeshFirstIndex, gTlasIndex) and the grid bounds
 // (gMeshSdfMin/Max). Root constants: rc0 = seed UAV (src), rc1 = seed UAV (dst), rc2 = distance-key UAV,
-// rc3 = SDF UAV, rc4 = JFA step / seed pass, rc5 = triangle count, rc6 = threads per dispatch row.
+// rc3 = SDF UAV, rc4 = JFA step / seed pass, rc5 = triangle count, rc6 = threads per dispatch row,
+// rc7 = triangle-id UAV.
 
 #include "Common.hlsli"
 
@@ -36,28 +40,6 @@ void CS_SdfClear(uint3 v : SV_DispatchThreadID)
     keys[v] = 0xFFFFFFFFu;
 }
 
-// Ericson, Real-Time Collision Detection 5.1.5
-float3 ClosestPointOnTriangle(float3 p, float3 a, float3 b, float3 c)
-{
-    float3 ab = b - a, ac = c - a, ap = p - a;
-    float d1 = dot(ab, ap), d2 = dot(ac, ap);
-    if (d1 <= 0 && d2 <= 0) return a;
-    float3 bp = p - b;
-    float d3 = dot(ab, bp), d4 = dot(ac, bp);
-    if (d3 >= 0 && d4 <= d3) return b;
-    float vc = d1 * d4 - d3 * d2;
-    if (vc <= 0 && d1 >= 0 && d3 <= 0) return a + ab * (d1 / (d1 - d3));
-    float3 cp = p - c;
-    float d5 = dot(ab, cp), d6 = dot(ac, cp);
-    if (d6 >= 0 && d5 <= d6) return c;
-    float vb = d5 * d2 - d1 * d6;
-    if (vb <= 0 && d2 >= 0 && d6 <= 0) return a + ac * (d2 / (d2 - d6));
-    float va = d3 * d6 - d5 * d4;
-    if (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
-    float denom = 1.0 / (va + vb + vc);
-    return a + ab * (vb * denom) + ac * (vc * denom);
-}
-
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void CS_SdfSeed(uint3 id : SV_DispatchThreadID)
@@ -73,8 +55,10 @@ void CS_SdfSeed(uint3 id : SV_DispatchThreadID)
     float3 voxel = (gMeshSdfMax - gMeshSdfMin) / float3(dims);
     int3 lo = max(int3(floor((min(a, min(b, c)) - gMeshSdfMin) / voxel - 1.0)), 0);
     int3 hi = min(int3(ceil((max(a, max(b, c)) - gMeshSdfMin) / voxel + 1.0)), int3(dims) - 1);
-    hi = min(hi, lo + 15);   // cap huge triangles (not an issue for scanned meshes)
+    hi = min(hi, lo + 255);   // architecture has a few huge triangles (floors, walls)
     float band = max(voxel.x, max(voxel.y, voxel.z));
+    float3 n = normalize(cross(b - a, c - a));
+    uint triCode = gMeshFirstIndex / 3 + tri + 1;
 
     RWTexture3D<uint> keys = ResourceDescriptorHeap[rc2];
     RWTexture3D<float4> seeds = ResourceDescriptorHeap[rc0];
@@ -84,6 +68,7 @@ void CS_SdfSeed(uint3 id : SV_DispatchThreadID)
     {
         uint3 v = uint3(x, y, z);
         float3 center = VoxelCenter(v, dims);
+        if (abs(dot(center - a, n)) > band) continue;   // cheap plane test for big triangles
         float3 cp = ClosestPointOnTriangle(center, a, b, c);
         if (any(isnan(cp))) continue;
         float d = length(cp - center);
@@ -92,7 +77,7 @@ void CS_SdfSeed(uint3 id : SV_DispatchThreadID)
         if (rc4 == 0)
             InterlockedMin(keys[v], key);
         else if (keys[v] == key)
-            seeds[v] = float4(cp, 1);
+            seeds[v] = float4(cp, asfloat(triCode));
     }
 }
 
@@ -107,7 +92,7 @@ void CS_SdfJfa(uint3 v : SV_DispatchThreadID)
     int step = (int)rc4;
     float3 center = VoxelCenter(v, dims);
     float4 best = src[v];
-    float bestD = best.w > 0 ? length(best.xyz - center) : 1e30;
+    float bestD = asuint(best.w) != 0 ? length(best.xyz - center) : 1e30;
     for (int z = -1; z <= 1; z++)
     for (int y = -1; y <= 1; y++)
     for (int x = -1; x <= 1; x++)
@@ -115,7 +100,7 @@ void CS_SdfJfa(uint3 v : SV_DispatchThreadID)
         int3 n = int3(v) + int3(x, y, z) * step;
         if (any(n < 0) || any(n >= int3(dims))) continue;
         float4 s = src[n];
-        if (s.w <= 0) continue;
+        if (asuint(s.w) == 0) continue;
         float d = length(s.xyz - center);
         if (d < bestD) { bestD = d; best = s; }
     }
@@ -132,7 +117,10 @@ void CS_SdfFinalize(uint3 v : SV_DispatchThreadID)
     RWTexture3D<float> sdf = ResourceDescriptorHeap[rc3];
     float3 center = VoxelCenter(v, dims);
     float4 s = seeds[v];
-    float d = s.w > 0 ? length(s.xyz - center) : length(gMeshSdfMax - gMeshSdfMin);
+    float d = asuint(s.w) != 0 ? length(s.xyz - center) : length(gMeshSdfMax - gMeshSdfMin);
+    RWTexture3D<uint> triIds = ResourceDescriptorHeap[rc7];
+    triIds[v] = asuint(s.w);
+    if ((gBakeFlags & 1) == 0) { sdf[v] = d; return; }   // open mesh: unsigned distance
 
     // inside/outside: majority vote of 3 rays (robust against the odd hole or grazing hit)
     static const float3 dirs[3] = { float3(0.577, 0.577, 0.577), float3(-0.707, 0.1, 0.7), float3(0.2, -0.95, -0.24) };

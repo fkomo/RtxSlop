@@ -1,5 +1,4 @@
 using System.Numerics;
-using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using Vortice.Direct3D;
 using Vortice.Direct3D12;
@@ -11,26 +10,30 @@ using ShaderResourceViewDimension = Vortice.Direct3D12.ShaderResourceViewDimensi
 
 namespace RtxSlop;
 
-public sealed unsafe class Renderer : IDisposable
+/// <summary>
+/// Device, swap chain, pipelines and the per-frame passes of all five modes. Per-scene GPU data
+/// (buffers, acceleration structures, textures, SDF grids) lives in <see cref="SceneGpu"/> (RendererScene.cs).
+/// </summary>
+public sealed unsafe partial class Renderer : IDisposable
 {
     const int FrameCount = 2;          // frames in flight
     const int BackBufferCount = 3;
+    const int MaxLights = 3;
     const int ShadowSize = 1024;
     const int ProbeSize = 256;
-    const float ShadowNear = 0.05f, ShadowFar = 30f;
-    const int HudWidth = 560, HudHeight = 216;
+    const float ShadowNear = 0.05f;
+    const int HudWidth = 560, HudHeight = 234;
     const Format HdrFormat = Format.R16G16B16A16_Float;
     const int MsaaSamples = 4;
 
-    // Fixed bindless descriptor slots
-    const int SlotVB = 0, SlotIB = 1, SlotMat = 2, SlotTlas = 3, SlotShadow = 4, SlotProbe = 5, SlotHud = 6;
+    // Fixed bindless descriptor slots (per-scene resources are allocated from FirstDynamicSlot upwards)
+    const int SrvHeapSize = 4096;
+    const int FirstDynamicSlot = 64;
+    const int SlotShadow = 4, SlotProbe = 5, SlotHud = 6, SlotProbe1 = 7;
     const int SlotHdrSrv = 10, SlotHdrUav = 11;
     public const int SlotRefl0 = 12;
     const int SlotPtBase = 20;   // PT textures: srv = base + 2k, uav = base + 2k + 1 (slots 20..39)
-    const int SlotGBufPos = 40, SlotGBufNrm = 41, SlotSdf = 42, SlotSceneColor = 43;
-    const int SlotProbe1 = 7;
-    const int SlotBakeSeed0 = 44, SlotBakeSeed1 = 45, SlotBakeKeys = 46, SlotBakeSdfUav = 47, SlotMeshSdf = 48;
-    const int SdfGridResolution = 128;   // voxels along the longest axis of the mesh bounds
+    const int SlotGBufPos = 40, SlotGBufNrm = 41, SlotSceneColor = 43;
     public static uint ProbeSlot(int i) => (uint)(i == 0 ? SlotProbe : SlotProbe1);
     const Format GBufPosFormat = Format.R32G32B32A32_Float, GBufNrmFormat = Format.R32G32B32A32_Float;
 
@@ -39,7 +42,6 @@ public sealed unsafe class Renderer : IDisposable
     public int Height { get; private set; }
     public double GpuTimeMs { get; private set; }
 
-    readonly Scene scene;
     readonly bool debug;
     readonly IDXGIFactory6 factory;
     readonly ID3D12Device5 device;
@@ -62,20 +64,14 @@ public sealed unsafe class Renderer : IDisposable
 
     ID3D12RootSignature rootSig;
     ID3D12PipelineState psoMain, psoMainMsaa, psoMainMirrored, psoShadow, psoTonemap, psoRayTrace, psoPathTrace, psoTemporal, psoAtrous, psoGBuffer, psoSdf,
-        psoGlass, psoGlassMsaa, psoBakeClear, psoBakeSeed, psoBakeJfa, psoBakeFinalize;
+        psoGlass, psoGlassMsaa, psoSky, psoSkyMsaa, psoBakeClear, psoBakeSeed, psoBakeJfa, psoBakeFinalize, psoSkyVis;
 
-    // static scene data
-    ID3D12Resource vb, ib, matBuf, sdfBuf;
-    ID3D12Resource blasStatic, blasGlass, blasSphere, blasMesh, tlas, tlasScratch;
-    GpuTexture meshSdf;
-    Vector3 meshSdfMin, meshSdfMax;
     readonly List<(int Index, Material Material)> pendingMaterials = new();
-    BuildRaytracingAccelerationStructureInputs tlasInputs;
 
     // fixed size render targets
     GpuTexture shadowMap, probeDepth, hud;
-    GpuTexture[] probes = new GpuTexture[2];   // 0 = chrome sphere, 1 = mesh
-    CpuDescriptorHandle[] shadowDsv = new CpuDescriptorHandle[18];
+    GpuTexture[] probes = new GpuTexture[2];   // 0 = chrome sphere (room), 1 = model
+    CpuDescriptorHandle[] shadowDsv = new CpuDescriptorHandle[6 * MaxLights];
     CpuDescriptorHandle[,] probeRtv = new CpuDescriptorHandle[2, 6];
 
     // size dependent
@@ -99,9 +95,8 @@ public sealed unsafe class Renderer : IDisposable
     byte[] pendingHud;
     string pendingCapture;
 
-    public Renderer(IntPtr hwnd, int width, int height, Scene scene, string shaderDir, bool debug)
+    public Renderer(IntPtr hwnd, int width, int height, Scene initialScene, string shaderDir, bool debug)
     {
-        this.scene = scene;
         this.debug = debug;
         Width = Math.Max(1, width);
         Height = Math.Max(1, height);
@@ -152,7 +147,7 @@ public sealed unsafe class Renderer : IDisposable
             swapChain = sc1.QueryInterface<IDXGISwapChain3>();
         factory.MakeWindowAssociation(hwnd, WindowAssociationFlags.IgnoreAltEnter);
 
-        srvHeap = device.CreateDescriptorHeap(new DescriptorHeapDescription(DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 128, DescriptorHeapFlags.ShaderVisible));
+        srvHeap = device.CreateDescriptorHeap(new DescriptorHeapDescription(DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, SrvHeapSize, DescriptorHeapFlags.ShaderVisible));
         rtvHeap = device.CreateDescriptorHeap(new DescriptorHeapDescription(DescriptorHeapType.RenderTargetView, 32, DescriptorHeapFlags.None));
         dsvHeap = device.CreateDescriptorHeap(new DescriptorHeapDescription(DescriptorHeapType.DepthStencilView, 32, DescriptorHeapFlags.None));
         srvInc = device.GetDescriptorHandleIncrementSize(DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
@@ -174,9 +169,9 @@ public sealed unsafe class Renderer : IDisposable
         timestampPeriodMs = 1000.0 / freq;
 
         CreatePipelines(shaderDir);
-        CreateSceneResources();
         CreateFixedTargets();
         CreateSizeDependent();
+        SetScene(initialScene);
     }
 
     // =============================================================================================
@@ -244,225 +239,12 @@ public sealed unsafe class Renderer : IDisposable
         t.State = to;
     }
 
-    void CreateSceneResources()
-    {
-        var uploads = new List<IDisposable>();
-        ID3D12Resource Upload<T>(string name, List<T> data, ResourceFlags flags = ResourceFlags.None) where T : unmanaged
-        {
-            ulong size = (ulong)(data.Count * sizeof(T));
-            var dst = CreateBuffer(name, size, HeapType.Default, flags, ResourceStates.Common);
-            var src = CreateBuffer(name + " upload", size, HeapType.Upload, ResourceFlags.None, ResourceStates.GenericRead);
-            var span = CollectionsMarshal.AsSpan(data);
-            src.SetData<T>(span);
-            uploads.Add(src);
-            cl.CopyBufferRegion(dst, 0, src, 0, size);
-            cl.ResourceBarrierTransition(dst, ResourceStates.CopyDest, ResourceStates.AllShaderResource, D3D12.ResourceBarrierAllSubResources, ResourceBarrierFlags.None);
-            return dst;
-        }
-
-        allocators[0].Reset();
-        cl.Reset(allocators[0], null);
-
-        vb = Upload("Vertices", scene.Vertices);
-        ib = Upload("Indices", scene.Indices);
-        matBuf = Upload("Materials", scene.Materials);
-        CreateStructuredSrv(vb, SlotVB, scene.Vertices.Count, sizeof(Vertex));
-        CreateStructuredSrv(ib, SlotIB, scene.Indices.Count, 4);
-        CreateStructuredSrv(matBuf, SlotMat, scene.Materials.Count, sizeof(Material));
-        sdfBuf = Upload("SDF primitives", scene.SdfPrims);
-        CreateStructuredSrv(sdfBuf, SlotSdf, scene.SdfPrims.Count, sizeof(SdfPrim));
-
-        // ---- bottom level acceleration structures ----
-        ID3D12Resource BuildBlas(string name, int firstIndex, int indexCount)
-        {
-            var geo = new RaytracingGeometryDescription(new RaytracingGeometryTrianglesDescription
-            {
-                VertexBuffer = new GpuVirtualAddressAndStride(vb.GPUVirtualAddress, (ulong)sizeof(Vertex)),
-                VertexFormat = Format.R32G32B32_Float,
-                VertexCount = (uint)scene.Vertices.Count,
-                IndexBuffer = ib.GPUVirtualAddress + (ulong)firstIndex * 4,
-                IndexFormat = Format.R32_UInt,
-                IndexCount = (uint)indexCount,
-                Transform3x4 = 0,
-            }, RaytracingGeometryFlags.Opaque);
-            var inputs = new BuildRaytracingAccelerationStructureInputs
-            {
-                Type = RaytracingAccelerationStructureType.BottomLevel,
-                Flags = RaytracingAccelerationStructureBuildFlags.PreferFastTrace,
-                Layout = ElementsLayout.Array,
-                DescriptorsCount = 1,
-                GeometryDescriptions = new[] { geo },
-            };
-            var info = device.GetRaytracingAccelerationStructurePrebuildInfo(inputs);
-            var result = CreateBuffer(name, info.ResultDataMaxSizeInBytes, HeapType.Default, ResourceFlags.AllowUnorderedAccess, ResourceStates.RaytracingAccelerationStructure);
-            var scratch = CreateBuffer(name + " scratch", info.ScratchDataSizeInBytes, HeapType.Default, ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
-            uploads.Add(scratch);
-            cl.BuildRaytracingAccelerationStructure(new BuildRaytracingAccelerationStructureDescription
-            {
-                DestinationAccelerationStructureData = result.GPUVirtualAddress,
-                Inputs = inputs,
-                ScratchAccelerationStructureData = scratch.GPUVirtualAddress,
-            });
-            cl.ResourceBarrierUnorderedAccessView(result);
-            return result;
-        }
-
-        cl.ResourceBarrierUnorderedAccessView(null);
-        blasStatic = BuildBlas("BLAS static", 0, scene.GlassFirstIndex);
-        if (scene.StaticIndexCount > scene.GlassFirstIndex)
-            blasGlass = BuildBlas("BLAS static glass", scene.GlassFirstIndex, scene.StaticIndexCount - scene.GlassFirstIndex);
-        blasSphere = BuildBlas("BLAS light sphere", scene.SphereFirstIndex, scene.SphereIndexCount);
-        if (scene.HasMesh)
-            blasMesh = BuildBlas("BLAS mesh", scene.MeshFirstIndex, scene.MeshIndexCount);
-
-        // ---- top level: static room + 1 instance per light (+ mesh), rebuilt every frame ----
-        tlasInputs = new BuildRaytracingAccelerationStructureInputs
-        {
-            Type = RaytracingAccelerationStructureType.TopLevel,
-            Flags = RaytracingAccelerationStructureBuildFlags.PreferFastBuild,
-            Layout = ElementsLayout.Array,
-            DescriptorsCount = (uint)TlasInstanceCount,
-        };
-        var tinfo = device.GetRaytracingAccelerationStructurePrebuildInfo(tlasInputs);
-        tlas = CreateBuffer("TLAS", tinfo.ResultDataMaxSizeInBytes, HeapType.Default, ResourceFlags.AllowUnorderedAccess, ResourceStates.RaytracingAccelerationStructure);
-        tlasScratch = CreateBuffer("TLAS scratch", Math.Max(tinfo.ScratchDataSizeInBytes, tinfo.UpdateScratchDataSizeInBytes), HeapType.Default, ResourceFlags.AllowUnorderedAccess, ResourceStates.Common);
-        device.CreateShaderResourceView(null, new ShaderResourceViewDescription
-        {
-            Format = Format.Unknown,
-            ViewDimension = ShaderResourceViewDimension.RaytracingAccelerationStructure,
-            Shader4ComponentMapping = ShaderComponentMapping.Default,
-            RaytracingAccelerationStructure = new RaytracingAccelerationStructureShaderResourceView { Location = tlas.GPUVirtualAddress },
-        }, SrvCpu(SlotTlas));
-
-        if (scene.HasMesh)
-            BakeMeshSdf(uploads);
-
-        cl.Close();
-        queue.ExecuteCommandList(cl);
-        WaitIdle();
-        foreach (var u in uploads) u.Dispose();
-    }
-
-    int TlasInstanceCount => 1 + scene.Lights.Length + (scene.HasMesh ? 1 : 0) + (blasGlass != null ? 1 : 0);
-
-    // ---------------------------------------------------------------------------------------------
-    // SDF mode: bake the mesh into a 3D signed distance texture (SdfBake.hlsl), once at startup
-    // ---------------------------------------------------------------------------------------------
-    GpuTexture CreateTexture3D(string name, Format fmt, int w, int h, int d, ResourceFlags flags, ResourceStates state)
-    {
-        var desc = ResourceDescription.Texture3D(fmt, (uint)w, (uint)h, (ushort)d, 1, flags);
-        var res = device.CreateCommittedResource(HeapType.Default, HeapFlags.None, desc, state, null);
-        res.Name = name;
-        return new GpuTexture { Resource = res, State = state, Width = w, Height = h };
-    }
-
-    void CreateUav3D(GpuTexture t, int slot, Format fmt, int depth3D)
-    {
-        t.Uav = slot;
-        device.CreateUnorderedAccessView(t.Resource, null, new UnorderedAccessViewDescription
-        {
-            Format = fmt,
-            ViewDimension = UnorderedAccessViewDimension.Texture3D,
-            Texture3D = new Texture3DUnorderedAccessView { MipSlice = 0, FirstWSlice = 0, WSize = (uint)depth3D },
-        }, SrvCpu(slot));
-    }
-
-    void BakeMeshSdf(List<IDisposable> temporaries)
-    {
-        var prim = scene.SdfPrims.Last(p => p.Type == SdfPrim.Mesh);
-        var extent = prim.Size * 2;
-        float voxel = MathF.Max(extent.X, MathF.Max(extent.Y, extent.Z)) / SdfGridResolution;
-        int dx = Math.Max(4, (int)MathF.Ceiling(extent.X / voxel));
-        int dy = Math.Max(4, (int)MathF.Ceiling(extent.Y / voxel));
-        int dz = Math.Max(4, (int)MathF.Ceiling(extent.Z / voxel));
-        meshSdfMin = prim.Center - prim.Size;
-        meshSdfMax = meshSdfMin + new Vector3(dx, dy, dz) * voxel;
-
-        var seeds = new[]
-        {
-            CreateTexture3D("SDF bake seeds 0", Format.R32G32B32A32_Float, dx, dy, dz, ResourceFlags.AllowUnorderedAccess, ResourceStates.UnorderedAccess),
-            CreateTexture3D("SDF bake seeds 1", Format.R32G32B32A32_Float, dx, dy, dz, ResourceFlags.AllowUnorderedAccess, ResourceStates.UnorderedAccess),
-        };
-        var keys = CreateTexture3D("SDF bake keys", Format.R32_UInt, dx, dy, dz, ResourceFlags.AllowUnorderedAccess, ResourceStates.UnorderedAccess);
-        meshSdf = CreateTexture3D("Mesh SDF", Format.R32_Float, dx, dy, dz, ResourceFlags.AllowUnorderedAccess, ResourceStates.UnorderedAccess);
-        CreateUav3D(seeds[0], SlotBakeSeed0, Format.R32G32B32A32_Float, dz);
-        CreateUav3D(seeds[1], SlotBakeSeed1, Format.R32G32B32A32_Float, dz);
-        CreateUav3D(keys, SlotBakeKeys, Format.R32_UInt, dz);
-        CreateUav3D(meshSdf, SlotBakeSdfUav, Format.R32_Float, dz);
-        meshSdf.Srv = SlotMeshSdf;
-        device.CreateShaderResourceView(meshSdf.Resource, new ShaderResourceViewDescription
-        {
-            Format = Format.R32_Float,
-            ViewDimension = ShaderResourceViewDimension.Texture3D,
-            Shader4ComponentMapping = ShaderComponentMapping.Default,
-            Texture3D = new Texture3DShaderResourceView { MipLevels = 1 },
-        }, SrvCpu(SlotMeshSdf));
-        temporaries.AddRange(seeds);
-        temporaries.Add(keys);
-
-        // the sign test ray-queries the mesh, so the TLAS must exist
-        var ring = rings[0];
-        ring.Reset();
-        cl.SetDescriptorHeaps(srvHeap);
-        cl.SetComputeRootSignature(rootSig);
-        BuildTlas(ring);
-        var fd = new FrameData
-        {
-            VbIndex = SlotVB, IbIndex = SlotIB, MatIndex = SlotMat, TlasIndex = SlotTlas,
-            MeshFirstIndex = (uint)scene.MeshFirstIndex, MeshSdfMin = meshSdfMin, MeshSdfMax = meshSdfMax,
-        };
-        cl.SetComputeRootConstantBufferView(1, ring.Push(fd));
-        cl.SetComputeRootConstantBufferView(2, ring.Push(new PassData()));
-
-        void Barrier() => cl.ResourceBarrierUnorderedAccessView(null);
-        void DispatchGrid() => cl.Dispatch((uint)(dx + 3) / 4, (uint)(dy + 3) / 4, (uint)(dz + 3) / 4);
-
-        cl.SetPipelineState(psoBakeClear);
-        RootConstants(true, SlotBakeSeed0, SlotBakeSeed1, SlotBakeKeys, SlotBakeSdfUav, 0, 0, 0);
-        DispatchGrid();
-        Barrier();
-
-        int tris = scene.MeshIndexCount / 3;
-        int groups = (tris + 63) / 64;
-        int gx = Math.Min(groups, 65535), gy = (groups + gx - 1) / gx;
-        cl.SetPipelineState(psoBakeSeed);
-        for (uint pass = 0; pass < 2; pass++)
-        {
-            RootConstants(true, SlotBakeSeed0, SlotBakeSeed1, SlotBakeKeys, SlotBakeSdfUav, pass, (uint)tris, (uint)(gx * 64));
-            cl.Dispatch((uint)gx, (uint)gy, 1);
-            Barrier();
-        }
-
-        // jump flooding: N/2, N/4, ..., 1, then one more 1 ("JFA+1") to fix the rare wrong pick
-        cl.SetPipelineState(psoBakeJfa);
-        int maxDim = Math.Max(dx, Math.Max(dy, dz));
-        int step = 1;
-        while (step * 2 < maxDim) step *= 2;
-        var steps = new List<int>();
-        for (; step >= 1; step /= 2) steps.Add(step);
-        steps.Add(1);
-        int src = 0;
-        foreach (int st in steps)
-        {
-            RootConstants(true, (uint)seeds[src].Uav, (uint)seeds[1 - src].Uav, SlotBakeKeys, SlotBakeSdfUav, (uint)st, 0, 0);
-            DispatchGrid();
-            Barrier();
-            src = 1 - src;
-        }
-
-        cl.SetPipelineState(psoBakeFinalize);
-        RootConstants(true, (uint)seeds[src].Uav, 0, SlotBakeKeys, SlotBakeSdfUav, 0, 0, 0);
-        DispatchGrid();
-        Transition(meshSdf, ResourceStates.AllShaderResource);
-    }
-
     void CreateFixedTargets()
     {
         // omnidirectional shadow maps: 3 lights x 6 faces in one cube array
-        int lights = scene.Lights.Length;
-        shadowMap = CreateTexture("Shadow cube array", Format.R32_Typeless, ShadowSize, ShadowSize, 6 * lights,
+        shadowMap = CreateTexture("Shadow cube array", Format.R32_Typeless, ShadowSize, ShadowSize, 6 * MaxLights,
             ResourceFlags.AllowDepthStencil, ResourceStates.AllShaderResource, new ClearValue(Format.D32_Float, 1.0f, 0));
-        for (int i = 0; i < 6 * lights; i++)
+        for (int i = 0; i < 6 * MaxLights; i++)
         {
             shadowDsv[i] = AllocDsv();
             device.CreateDepthStencilView(shadowMap.Resource, new DepthStencilViewDescription
@@ -478,10 +260,10 @@ public sealed unsafe class Renderer : IDisposable
             Format = Format.R32_Float,
             ViewDimension = ShaderResourceViewDimension.TextureCubeArray,
             Shader4ComponentMapping = ShaderComponentMapping.Default,
-            TextureCubeArray = new TextureCubeArrayShaderResourceView { MipLevels = 1, First2DArrayFace = 0, NumCubes = (uint)lights },
+            TextureCubeArray = new TextureCubeArrayShaderResourceView { MipLevels = 1, First2DArrayFace = 0, NumCubes = MaxLights },
         }, SrvCpu(SlotShadow));
 
-        // dynamic reflection probes (cube maps rendered from the chrome sphere's / the mesh's center)
+        // dynamic reflection probes (cube maps rendered from the chrome sphere's / the model's center)
         for (int p = 0; p < 2; p++)
         {
             var probe = probes[p] = CreateTexture($"Reflection probe {p}", HdrFormat, ProbeSize, ProbeSize, 6, ResourceFlags.AllowRenderTarget,
@@ -518,7 +300,7 @@ public sealed unsafe class Renderer : IDisposable
     void CreateSizeDependent()
     {
         nextRtv = 12;   // first 12 RTVs belong to the two probes
-        nextDsv = 18 + 1;
+        nextDsv = 6 * MaxLights + 1;
 
         for (int i = 0; i < BackBufferCount; i++)
         {
@@ -586,7 +368,7 @@ public sealed unsafe class Renderer : IDisposable
         gbufPos.Rtv = AllocRtv();
         device.CreateRenderTargetView(gbufPos.Resource, null, gbufPos.Rtv);
         CreateTexSrv(gbufPos, SlotGBufPos, GBufPosFormat);
-        gbufNrm = CreateTexture("GBuffer normal+material", GBufNrmFormat, Width, Height, 1, ResourceFlags.AllowRenderTarget, ResourceStates.AllShaderResource, new ClearValue(GBufNrmFormat, zero));
+        gbufNrm = CreateTexture("GBuffer normal+triangle", GBufNrmFormat, Width, Height, 1, ResourceFlags.AllowRenderTarget, ResourceStates.AllShaderResource, new ClearValue(GBufNrmFormat, zero));
         gbufNrm.Rtv = AllocRtv();
         device.CreateRenderTargetView(gbufNrm.Resource, null, gbufNrm.Rtv);
         CreateTexSrv(gbufNrm, SlotGBufNrm, GBufNrmFormat);
@@ -647,24 +429,22 @@ public sealed unsafe class Renderer : IDisposable
     void CreatePipelines(string dir)
     {
         // Compile everything first so a broken shader during hot reload keeps the old pipelines alive.
-        var vsMain = Compile(dir, "Raster.hlsl", "VS_Main", "vs_6_6");
-        var psMain = Compile(dir, "Raster.hlsl", "PS_Main", "ps_6_6");
-        var vsShadow = Compile(dir, "Raster.hlsl", "VS_Shadow", "vs_6_6");
-        var psGBuffer = Compile(dir, "Raster.hlsl", "PS_GBuffer", "ps_6_6");
-        var psGlass = Compile(dir, "Raster.hlsl", "PS_Glass", "ps_6_6");
-        var csBakeClear = Compile(dir, "SdfBake.hlsl", "CS_SdfClear", "cs_6_6");
-        var csBakeSeed = Compile(dir, "SdfBake.hlsl", "CS_SdfSeed", "cs_6_6");
-        var csBakeJfa = Compile(dir, "SdfBake.hlsl", "CS_SdfJfa", "cs_6_6");
-        var csBakeFinalize = Compile(dir, "SdfBake.hlsl", "CS_SdfFinalize", "cs_6_6");
-        var vsFs = Compile(dir, "Post.hlsl", "VS_Fullscreen", "vs_6_6");
-        var psTone = Compile(dir, "Post.hlsl", "PS_Tonemap", "ps_6_6");
-        var csRt = Compile(dir, "RayTrace.hlsl", "CS_RayTrace", "cs_6_6");
-        var csPt = Compile(dir, "PathTrace.hlsl", "CS_PathTrace", "cs_6_6");
-        var csTemporal = Compile(dir, "Denoise.hlsl", "CS_Temporal", "cs_6_6");
-        var csAtrous = Compile(dir, "Denoise.hlsl", "CS_Atrous", "cs_6_6");
-        var csSdf = Compile(dir, "Sdf.hlsl", "CS_Sdf", "cs_6_6");
+        var jobs = new (string File, string Entry, string Profile)[]
+        {
+            ("Raster.hlsl", "VS_Main", "vs_6_6"), ("Raster.hlsl", "PS_Main", "ps_6_6"), ("Raster.hlsl", "PS_ShadowClip", "ps_6_6"),
+            ("Raster.hlsl", "PS_GBuffer", "ps_6_6"), ("Raster.hlsl", "PS_Glass", "ps_6_6"), ("Raster.hlsl", "VS_Sky", "vs_6_6"),
+            ("Raster.hlsl", "PS_Sky", "ps_6_6"), ("Post.hlsl", "VS_Fullscreen", "vs_6_6"), ("Post.hlsl", "PS_Tonemap", "ps_6_6"),
+            ("RayTrace.hlsl", "CS_RayTrace", "cs_6_6"), ("PathTrace.hlsl", "CS_PathTrace", "cs_6_6"),
+            ("Denoise.hlsl", "CS_Temporal", "cs_6_6"), ("Denoise.hlsl", "CS_Atrous", "cs_6_6"), ("Sdf.hlsl", "CS_Sdf", "cs_6_6"),
+            ("SdfBake.hlsl", "CS_SdfClear", "cs_6_6"), ("SdfBake.hlsl", "CS_SdfSeed", "cs_6_6"), ("SdfBake.hlsl", "CS_SdfJfa", "cs_6_6"),
+            ("SdfBake.hlsl", "CS_SdfFinalize", "cs_6_6"), ("SceneBake.hlsl", "CS_SkyVisibility", "cs_6_6"),
+        };
+        var code = new byte[jobs.Length][];
+        Parallel.For(0, jobs.Length, i => code[i] = Compile(dir, jobs[i].File, jobs[i].Entry, jobs[i].Profile));
+        byte[] Code(string entry) => code[Array.FindIndex(jobs, j => j.Entry == entry)];
 
         DisposePipelines();
+        var vsMain = Code("VS_Main");
         rootSig = device.CreateRootSignature(0, vsMain);
 
         GraphicsPipelineStateDescription Gfx(byte[] vs, byte[] ps, RasterizerDescription rs, Format[] rtvs, Format dsv, DepthStencilDescription ds, int samples = 1) => new()
@@ -682,31 +462,36 @@ public sealed unsafe class Renderer : IDisposable
             SampleDescription = new SampleDescription((uint)samples, 0),
         };
 
-        var cullBack = new RasterizerDescription(CullMode.Back, FillMode.Solid);
-        var cullBackMirrored = new RasterizerDescription(CullMode.Back, FillMode.Solid) { FrontCounterClockwise = true };
-        // shadow casters: render back faces (cull front) + slope bias -> almost no acne, no peter-panning
-        var shadowRs = new RasterizerDescription(CullMode.Front, FillMode.Solid) { SlopeScaledDepthBias = 1.0f, DepthBias = 0, DepthBiasClamp = 0.0f };
+        // Two-sided everywhere: foliage and much of the architecture are single-sided sheets.
+        var noCull = new RasterizerDescription(CullMode.None, FillMode.Solid);
+        var noCullMsaa = new RasterizerDescription(CullMode.None, FillMode.Solid) { MultisampleEnable = true };
+        var shadowRs = new RasterizerDescription(CullMode.None, FillMode.Solid) { SlopeScaledDepthBias = 1.5f, DepthBias = 0, DepthBiasClamp = 0.0f };
+        var skyDepth = new DepthStencilDescription(true, DepthWriteMask.Zero, ComparisonFunction.LessEqual);
+        var hdrRt = new[] { HdrFormat };
 
-        psoMain = device.CreateGraphicsPipelineState(Gfx(vsMain, psMain, cullBack, new[] { HdrFormat }, Format.D32_Float, DepthStencilDescription.Default));
-        psoMainMsaa = device.CreateGraphicsPipelineState(Gfx(vsMain, psMain, new RasterizerDescription(CullMode.Back, FillMode.Solid) { MultisampleEnable = true }, new[] { HdrFormat }, Format.D32_Float, DepthStencilDescription.Default, MsaaSamples));
-        psoGBuffer = device.CreateGraphicsPipelineState(Gfx(vsMain, psGBuffer, cullBack, new[] { GBufPosFormat, GBufNrmFormat }, Format.D32_Float, DepthStencilDescription.Default));
-        psoGlass = device.CreateGraphicsPipelineState(Gfx(vsMain, psGlass, cullBack, new[] { HdrFormat }, Format.D32_Float, DepthStencilDescription.Default));
-        psoGlassMsaa = device.CreateGraphicsPipelineState(Gfx(vsMain, psGlass, new RasterizerDescription(CullMode.Back, FillMode.Solid) { MultisampleEnable = true }, new[] { HdrFormat }, Format.D32_Float, DepthStencilDescription.Default, MsaaSamples));
-        psoMainMirrored = device.CreateGraphicsPipelineState(Gfx(vsMain, psMain, cullBackMirrored, new[] { HdrFormat }, Format.D32_Float, DepthStencilDescription.Default));
-        psoShadow = device.CreateGraphicsPipelineState(Gfx(vsShadow, null, shadowRs, Array.Empty<Format>(), Format.D32_Float, DepthStencilDescription.Default));
-        psoTonemap = device.CreateGraphicsPipelineState(Gfx(vsFs, psTone, new RasterizerDescription(CullMode.None, FillMode.Solid),
+        psoMain = device.CreateGraphicsPipelineState(Gfx(vsMain, Code("PS_Main"), noCull, hdrRt, Format.D32_Float, DepthStencilDescription.Default));
+        psoMainMsaa = device.CreateGraphicsPipelineState(Gfx(vsMain, Code("PS_Main"), noCullMsaa, hdrRt, Format.D32_Float, DepthStencilDescription.Default, MsaaSamples));
+        psoMainMirrored = device.CreateGraphicsPipelineState(Gfx(vsMain, Code("PS_Main"), noCull, hdrRt, Format.D32_Float, DepthStencilDescription.Default));
+        psoGBuffer = device.CreateGraphicsPipelineState(Gfx(vsMain, Code("PS_GBuffer"), noCull, new[] { GBufPosFormat, GBufNrmFormat }, Format.D32_Float, DepthStencilDescription.Default));
+        psoGlass = device.CreateGraphicsPipelineState(Gfx(vsMain, Code("PS_Glass"), noCull, hdrRt, Format.D32_Float, DepthStencilDescription.Default));
+        psoGlassMsaa = device.CreateGraphicsPipelineState(Gfx(vsMain, Code("PS_Glass"), noCullMsaa, hdrRt, Format.D32_Float, DepthStencilDescription.Default, MsaaSamples));
+        psoShadow = device.CreateGraphicsPipelineState(Gfx(vsMain, Code("PS_ShadowClip"), shadowRs, Array.Empty<Format>(), Format.D32_Float, DepthStencilDescription.Default));
+        psoSky = device.CreateGraphicsPipelineState(Gfx(Code("VS_Sky"), Code("PS_Sky"), noCull, hdrRt, Format.D32_Float, skyDepth));
+        psoSkyMsaa = device.CreateGraphicsPipelineState(Gfx(Code("VS_Sky"), Code("PS_Sky"), noCullMsaa, hdrRt, Format.D32_Float, skyDepth, MsaaSamples));
+        psoTonemap = device.CreateGraphicsPipelineState(Gfx(Code("VS_Fullscreen"), Code("PS_Tonemap"), noCull,
             new[] { Format.R8G8B8A8_UNorm_SRgb }, Format.Unknown, DepthStencilDescription.None));
 
-        ID3D12PipelineState Cs(byte[] cs) => device.CreateComputePipelineState(new ComputePipelineStateDescription { RootSignature = rootSig, ComputeShader = cs });
-        psoRayTrace = Cs(csRt);
-        psoPathTrace = Cs(csPt);
-        psoTemporal = Cs(csTemporal);
-        psoAtrous = Cs(csAtrous);
-        psoSdf = Cs(csSdf);
-        psoBakeClear = Cs(csBakeClear);
-        psoBakeSeed = Cs(csBakeSeed);
-        psoBakeJfa = Cs(csBakeJfa);
-        psoBakeFinalize = Cs(csBakeFinalize);
+        ID3D12PipelineState Cs(string entry) => device.CreateComputePipelineState(new ComputePipelineStateDescription { RootSignature = rootSig, ComputeShader = Code(entry) });
+        psoRayTrace = Cs("CS_RayTrace");
+        psoPathTrace = Cs("CS_PathTrace");
+        psoTemporal = Cs("CS_Temporal");
+        psoAtrous = Cs("CS_Atrous");
+        psoSdf = Cs("CS_Sdf");
+        psoBakeClear = Cs("CS_SdfClear");
+        psoBakeSeed = Cs("CS_SdfSeed");
+        psoBakeJfa = Cs("CS_SdfJfa");
+        psoBakeFinalize = Cs("CS_SdfFinalize");
+        psoSkyVis = Cs("CS_SkyVisibility");
     }
 
     // BlendDescription.Opaque only fills RenderTarget[0]; MRT pipelines need every slot valid.
@@ -720,7 +505,7 @@ public sealed unsafe class Renderer : IDisposable
     void DisposePipelines()
     {
         foreach (var p in new IDisposable[] { psoMain, psoMainMsaa, psoMainMirrored, psoShadow, psoTonemap, psoRayTrace, psoPathTrace, psoTemporal, psoAtrous, psoGBuffer, psoSdf,
-            psoGlass, psoGlassMsaa, psoBakeClear, psoBakeSeed, psoBakeJfa, psoBakeFinalize, rootSig })
+            psoGlass, psoGlassMsaa, psoSky, psoSkyMsaa, psoBakeClear, psoBakeSeed, psoBakeJfa, psoBakeFinalize, psoSkyVis, rootSig })
             p?.Dispose();
     }
 
@@ -728,29 +513,29 @@ public sealed unsafe class Renderer : IDisposable
     // Frame
     // =============================================================================================
     public void SetHud(byte[] bgra) => pendingHud = bgra;
+    public void RequestCapture(string path) => pendingCapture = path;
+    public static (int W, int H) HudSize => (HudWidth, HudHeight);
 
-    /// <summary>Replaces one entry of the GPU material buffer at the start of the next frame.</summary>
+    /// <summary>Replaces one entry of the current scene's GPU material buffer at the start of the next frame.</summary>
     public void SetMaterial(int index, Material material)
     {
-        pendingMaterials.Add((index, material));
+        pendingMaterials.Add((index, gpu.Remap(material)));
         historyValid = false;   // the path tracer's history is now wrong
     }
 
     void UploadMaterials(UploadRing ring)
     {
         if (pendingMaterials.Count == 0) return;
-        cl.ResourceBarrierTransition(matBuf, ResourceStates.AllShaderResource, ResourceStates.CopyDest, D3D12.ResourceBarrierAllSubResources, ResourceBarrierFlags.None);
+        cl.ResourceBarrierTransition(gpu.MatBuf, ResourceStates.AllShaderResource, ResourceStates.CopyDest, D3D12.ResourceBarrierAllSubResources, ResourceBarrierFlags.None);
         foreach (var (index, material) in pendingMaterials)
         {
             var a = ring.Alloc((ulong)sizeof(Material), 16);
             *(Material*)a.Cpu = material;
-            cl.CopyBufferRegion(matBuf, (ulong)(index * sizeof(Material)), ring.Buffer, a.Offset, (ulong)sizeof(Material));
+            cl.CopyBufferRegion(gpu.MatBuf, (ulong)(index * sizeof(Material)), ring.Buffer, a.Offset, (ulong)sizeof(Material));
         }
-        cl.ResourceBarrierTransition(matBuf, ResourceStates.CopyDest, ResourceStates.AllShaderResource, D3D12.ResourceBarrierAllSubResources, ResourceBarrierFlags.None);
+        cl.ResourceBarrierTransition(gpu.MatBuf, ResourceStates.CopyDest, ResourceStates.AllShaderResource, D3D12.ResourceBarrierAllSubResources, ResourceBarrierFlags.None);
         pendingMaterials.Clear();
     }
-    public void RequestCapture(string path) => pendingCapture = path;
-    public static (int W, int H) HudSize => (HudWidth, HudHeight);
 
     void RootConstants(bool compute, params uint[] v)
     {
@@ -783,11 +568,12 @@ public sealed unsafe class Renderer : IDisposable
         // ---- frame constants ----
         float aspect = (float)Width / Height;
         var view = camera.View;
-        var proj = Matrix4x4.CreatePerspectiveFieldOfViewLeftHanded(camera.FovY, aspect, 0.05f, 100f);
+        var proj = Matrix4x4.CreatePerspectiveFieldOfViewLeftHanded(camera.FovY, aspect, 0.05f, 200f);
         var viewProj = view * proj;
         Matrix4x4.Invert(viewProj, out var invViewProj);
         if (lastMode != s.Mode) historyValid = false;
         if (!historyValid) { prevViewProj = viewProj; prevCamPos = camera.Position; }
+        bool pathTraced = s.Mode is RenderMode.PathTrace or RenderMode.Hybrid;
 
         var fd = new FrameData
         {
@@ -800,24 +586,26 @@ public sealed unsafe class Renderer : IDisposable
             FrameIndex = (uint)frameCounter,
             ScreenSize = new Vector2(Width, Height),
             InvScreenSize = new Vector2(1f / Width, 1f / Height),
-            NumLights = (uint)scene.Lights.Length,
-            MaxBounces = (uint)(s.Mode is RenderMode.PathTrace or RenderMode.Hybrid ? s.PtBounces : s.RtBounces),
+            NumLights = s.LightsOn ? (uint)scene.Lights.Length : 0,
+            MaxBounces = (uint)(pathTraced ? s.PtBounces : s.RtBounces),
             Spp = (uint)s.Spp,
-            Ambient = s.Mode is RenderMode.PathTrace or RenderMode.Hybrid ? Vector3.Zero : new Vector3(0.025f, 0.025f, 0.03f),
+            Ambient = pathTraced ? Vector3.Zero : scene.Ambient,
             Exposure = s.Exposure,
             Light0 = scene.Lights[0], Light1 = scene.Lights[1], Light2 = scene.Lights[2],
-            VbIndex = SlotVB, IbIndex = SlotIB, MatIndex = SlotMat, TlasIndex = SlotTlas,
+            VbIndex = (uint)gpu.VbSlot, IbIndex = (uint)gpu.IbSlot, MatIndex = (uint)gpu.MatSlot, TlasIndex = (uint)gpu.TlasSlot,
             ShadowIndex = SlotShadow, ProbeIndex = SlotProbe, StaticIndexCount = (uint)scene.StaticIndexCount,
-            ProbePos = scene.ProbePositions[0], ShadowNear = ShadowNear, ShadowFar = ShadowFar,
+            ProbePos = scene.ProbePositions[0], ShadowNear = ShadowNear, ShadowFar = scene.ShadowFar,
             MeshFirstIndex = (uint)scene.MeshFirstIndex,
             GlassFirstIndex = (uint)scene.GlassFirstIndex,
+            AlphaFirstIndex = (uint)scene.AlphaFirstIndex,
             MeshMaterial = scene.HasMesh ? (uint)scene.MeshMaterialIndex : 0xFFFFFFFFu,
-            MeshSdfIndex = SlotMeshSdf, MeshSdfMin = meshSdfMin, MeshSdfMax = meshSdfMax,
+            SkyIntensity = scene.SkyIntensity,
+            PixelSpread = 2 * MathF.Tan(camera.FovY / 2) / Height,
         };
         ulong frameCb = ring.Push(fd);
         cl.SetGraphicsRootConstantBufferView(1, frameCb);
         cl.SetComputeRootConstantBufferView(1, frameCb);
-        ulong mainPass = ring.Push(new PassData { ViewProj = viewProj, CamPos = camera.Position, ClipPlane = new Vector4(0, 0, 0, 1) });
+        ulong mainPass = ring.Push(new PassData { ViewProj = viewProj, InvViewProj = invViewProj, CamPos = camera.Position, ClipPlane = new Vector4(0, 0, 0, 1) });
         cl.SetComputeRootConstantBufferView(2, mainPass);
 
         UploadHud(ring);
@@ -826,28 +614,28 @@ public sealed unsafe class Renderer : IDisposable
         switch (s.Mode)
         {
             case RenderMode.Raster:
-                RenderRaster(ring, camera, view, proj, mainPass, s.AntiAliasing);
+                RenderRaster(ring, camera, view, proj, mainPass, s.AntiAliasing, s.LightsOn);
                 break;
             case RenderMode.RayTrace:
-                BuildTlas(ring);
+                BuildTlas(ring, s.LightsOn);
                 Transition(hdr, ResourceStates.UnorderedAccess);
                 cl.SetPipelineState(psoRayTrace);
                 RootConstants(true, SlotHdrUav, s.AntiAliasing ? 4u : 1u);
                 Dispatch2D();
                 break;
             case RenderMode.PathTrace:
-                BuildTlas(ring);
+                BuildTlas(ring, s.LightsOn);
                 RenderPathTrace(s, fi, false);
                 break;
             case RenderMode.Sdf:
                 Transition(hdr, ResourceStates.UnorderedAccess);
                 cl.SetPipelineState(psoSdf);
-                RootConstants(true, SlotHdrUav, SlotSdf, (uint)scene.SdfPrims.Count, s.SdfAntiAliasing ? 4u : 1u, (uint)scene.SdfPlaneCount);
+                RootConstants(true, SlotHdrUav, (uint)gpu.SdfSlot, (uint)scene.SdfPrims.Count, s.SdfAntiAliasing ? 4u : 1u, (uint)scene.SdfPlaneCount);
                 Dispatch2D();
                 break;
             case RenderMode.Hybrid:
-                BuildTlas(ring);
-                RenderGBuffer(mainPass);
+                BuildTlas(ring, s.LightsOn);
+                RenderGBuffer(mainPass, s.LightsOn);
                 RenderPathTrace(s, fi, true);
                 break;
         }
@@ -919,7 +707,7 @@ public sealed unsafe class Renderer : IDisposable
         var data = pendingHud;
         if (data == null) return;
         pendingHud = null;
-        const uint rowPitch = HudWidth * 4;   // 2080 -> must be 256 aligned
+        const uint rowPitch = HudWidth * 4;
         uint pitch = (rowPitch + 255) & ~255u;
         var a = ring.Alloc((ulong)pitch * HudHeight, 512);
         fixed (byte* src = data)
@@ -944,6 +732,12 @@ public sealed unsafe class Renderer : IDisposable
         Matrix4x4.CreateLookAtLeftHanded(pos, pos + CubeDirs[face], CubeUps[face]) *
         Matrix4x4.CreatePerspectiveFieldOfViewLeftHanded(MathF.PI / 2, 1, near, far);
 
+    static PassData MakePass(Matrix4x4 viewProj, Vector3 camPos, uint flags, Vector4 clip)
+    {
+        Matrix4x4.Invert(viewProj, out var inv);
+        return new PassData { ViewProj = viewProj, InvViewProj = inv, CamPos = camPos, Flags = flags, ClipPlane = clip };
+    }
+
     void DrawScene(Func<SceneObject, bool> filter, bool lightBulbs)
     {
         foreach (var o in scene.Objects)
@@ -962,35 +756,46 @@ public sealed unsafe class Renderer : IDisposable
         }
     }
 
-    void RenderRaster(UploadRing ring, Camera camera, Matrix4x4 view, Matrix4x4 proj, ulong mainPass, bool msaa)
+    void DrawSky(bool msaa, int w, int h)
+    {
+        if (scene.SkyIntensity <= 0) return;
+        cl.SetPipelineState(msaa ? psoSkyMsaa : psoSky);
+        RootConstants(false, (uint)w, (uint)h);
+        cl.DrawInstanced(3, 1, 0, 0);
+    }
+
+    void RenderRaster(UploadRing ring, Camera camera, Matrix4x4 view, Matrix4x4 proj, ulong mainPass, bool msaa, bool lightsOn)
     {
         var noClip = new Vector4(0, 0, 0, 1);
         var glassObjects = scene.Objects.Where(scene.IsGlass).ToList();
 
         // 1) omnidirectional shadow maps: 6 faces per light
-        Transition(shadowMap, ResourceStates.DepthWrite);
-        cl.SetPipelineState(psoShadow);
-        SetViewport(ShadowSize, ShadowSize);
-        for (int l = 0; l < scene.Lights.Length; l++)
+        if (lightsOn)
         {
-            var lp = scene.Lights[l].Pos;
-            for (int f = 0; f < 6; f++)
+            Transition(shadowMap, ResourceStates.DepthWrite);
+            cl.SetPipelineState(psoShadow);
+            SetViewport(ShadowSize, ShadowSize);
+            for (int l = 0; l < scene.Lights.Length; l++)
             {
-                var dsv = shadowDsv[l * 6 + f];
-                cl.OMSetRenderTargets(0, (CpuDescriptorHandle*)null, false, dsv);
-                cl.ClearDepthStencilView(dsv, ClearFlags.Depth, 1, 0);
-                cl.SetGraphicsRootConstantBufferView(2, ring.Push(new PassData { ViewProj = CubeFaceViewProj(lp, f, ShadowNear, ShadowFar), CamPos = lp, ClipPlane = noClip }));
-                // mirrors hug the walls (nothing behind them to shadow); glass lets the light through
-                DrawScene(o => o.MirrorIndex < 0 && !scene.IsGlass(o), false);
+                var lp = scene.Lights[l].Pos;
+                for (int f = 0; f < 6; f++)
+                {
+                    var dsv = shadowDsv[l * 6 + f];
+                    cl.OMSetRenderTargets(0, (CpuDescriptorHandle*)null, false, dsv);
+                    cl.ClearDepthStencilView(dsv, ClearFlags.Depth, 1, 0);
+                    cl.SetGraphicsRootConstantBufferView(2, ring.Push(MakePass(CubeFaceViewProj(lp, f, ShadowNear, scene.ShadowFar), lp, 0, noClip)));
+                    // mirrors hug the walls (nothing behind them to shadow); glass lets the light through
+                    DrawScene(o => o.MirrorIndex < 0 && !scene.IsGlass(o), false);
+                }
             }
+            Transition(shadowMap, ResourceStates.AllShaderResource);
         }
-        Transition(shadowMap, ResourceStates.AllShaderResource);
 
-        // 2) dynamic reflection probes from the chrome sphere / mesh centers (each skips its own object)
-        cl.SetPipelineState(psoMain);
+        // 2) dynamic reflection probes from the chrome sphere / model centers (each skips its own object)
         SetViewport(ProbeSize, ProbeSize);
-        for (int p = 0; p < (scene.HasMesh ? 2 : 1); p++)
+        for (int p = 0; p < 2; p++)
         {
+            if (!scene.ProbeUsed[p]) continue;
             var pos = scene.ProbePositions[p];
             Transition(probes[p], ResourceStates.RenderTarget);
             for (int f = 0; f < 6; f++)
@@ -998,22 +803,17 @@ public sealed unsafe class Renderer : IDisposable
                 cl.OMSetRenderTargets(probeRtv[p, f], probeDepth.Dsv);
                 cl.ClearRenderTargetView(probeRtv[p, f], new Color4(0, 0, 0, 1));
                 cl.ClearDepthStencilView(probeDepth.Dsv, ClearFlags.Depth, 1, 0);
-                cl.SetGraphicsRootConstantBufferView(2, ring.Push(new PassData
-                {
-                    ViewProj = CubeFaceViewProj(pos, f, 0.05f, 50f),
-                    CamPos = pos,
-                    Flags = PassData.NoMirror | PassData.NoProbe,
-                    ClipPlane = noClip,
-                }));
+                cl.SetGraphicsRootConstantBufferView(2, ring.Push(MakePass(CubeFaceViewProj(pos, f, 0.05f, 100f), pos, PassData.NoMirror | PassData.NoProbe, noClip)));
                 int self = p;
-                DrawScene(o => o.ProbeCenter != self, true);
+                cl.SetPipelineState(psoMain);
+                DrawScene(o => o.ProbeCenter != self, lightsOn);
+                DrawSky(false, ProbeSize, ProbeSize);
             }
             Transition(probes[p], ResourceStates.AllShaderResource);
         }
 
         // 3) planar reflections: re-render the scene through each mirror
         SetViewport(Width, Height);
-        cl.SetPipelineState(psoMainMirrored);
         foreach (var m in scene.Mirrors)
         {
             int mi = scene.Objects[m.ObjectIndex].MirrorIndex;
@@ -1023,15 +823,12 @@ public sealed unsafe class Renderer : IDisposable
             cl.OMSetRenderTargets(target.Rtv, depth.Dsv);
             cl.ClearRenderTargetView(target.Rtv, new Color4(0, 0, 0, 1));
             cl.ClearDepthStencilView(depth.Dsv, ClearFlags.Depth, 1, 0);
-            cl.SetGraphicsRootConstantBufferView(2, ring.Push(new PassData
-            {
-                ViewProj = reflect * view * proj,
-                CamPos = Vector3.Transform(camera.Position, reflect),
-                Flags = PassData.NoMirror,
-                ClipPlane = new Vector4(m.Plane.Normal, m.Plane.D),
-            }));
+            cl.SetGraphicsRootConstantBufferView(2, ring.Push(MakePass(reflect * view * proj, Vector3.Transform(camera.Position, reflect),
+                PassData.NoMirror, new Vector4(m.Plane.Normal, m.Plane.D))));
             int skip = m.ObjectIndex;
-            DrawScene(o => scene.Objects.IndexOf(o) != skip, true);
+            cl.SetPipelineState(psoMainMirrored);
+            DrawScene(o => scene.Objects.IndexOf(o) != skip, lightsOn);
+            DrawSky(false, Width, Height);
             Transition(target, ResourceStates.AllShaderResource);
         }
 
@@ -1044,9 +841,10 @@ public sealed unsafe class Renderer : IDisposable
         cl.ClearRenderTargetView(color.Rtv, new Color4(0, 0, 0, 1));
         cl.ClearDepthStencilView(dsvMain, ClearFlags.Depth, 1, 0);
         cl.SetGraphicsRootConstantBufferView(2, mainPass);
-        DrawScene(o => !scene.IsGlass(o), true);
+        DrawScene(o => !scene.IsGlass(o), lightsOn);
+        DrawSky(msaa, Width, Height);
 
-        // 5) glass: needs the finished opaque image to refract, so copy it and draw the mesh on top
+        // 5) glass: needs the finished opaque image to refract, so copy it and draw the glass on top
         if (glassObjects.Count > 0)
         {
             if (msaa) ResolveMsaa();
@@ -1074,42 +872,9 @@ public sealed unsafe class Renderer : IDisposable
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Stage 2/3: acceleration structure update
-    // ---------------------------------------------------------------------------------------------
-    void BuildTlas(UploadRing ring)
-    {
-        int count = TlasInstanceCount;
-        var a = ring.Alloc((ulong)(count * sizeof(InstanceDesc)), 256);
-        var inst = (InstanceDesc*)a.Cpu;
-        inst[0] = InstanceDesc.Create(Matrix4x4.Identity, 0, 0x01, blasStatic.GPUVirtualAddress);
-        for (int i = 0; i < scene.Lights.Length; i++)
-        {
-            var L = scene.Lights[i];
-            var m = Matrix4x4.CreateScale(L.Radius) * Matrix4x4.CreateTranslation(L.Pos);
-            inst[1 + i] = InstanceDesc.Create(m, (uint)(1 + i), 0x02, blasSphere.GPUVirtualAddress);
-        }
-        int next = 1 + scene.Lights.Length;
-        if (scene.HasMesh)
-            inst[next++] = InstanceDesc.Create(Matrix4x4.Identity, 100, 0x04, blasMesh.GPUVirtualAddress);    // INSTANCE_MESH, MASK_MESH
-        if (blasGlass != null)
-            inst[next++] = InstanceDesc.Create(Matrix4x4.Identity, 101, 0x08, blasGlass.GPUVirtualAddress);   // INSTANCE_GLASS, MASK_GLASS
-        tlasInputs.InstanceDescriptions = a.Gpu;
-        cl.BuildRaytracingAccelerationStructure(new BuildRaytracingAccelerationStructureDescription
-        {
-            DestinationAccelerationStructureData = tlas.GPUVirtualAddress,
-            Inputs = tlasInputs,
-            ScratchAccelerationStructureData = tlasScratch.GPUVirtualAddress,
-        });
-        cl.ResourceBarrierUnorderedAccessView(tlas);
-    }
-
-    // ---------------------------------------------------------------------------------------------
-    // Stage 3: path tracing + denoiser
-    // ---------------------------------------------------------------------------------------------
-    // ---------------------------------------------------------------------------------------------
     // Stage 4 (hybrid): rasterize primary visibility into a G-buffer, path trace the rest from it
     // ---------------------------------------------------------------------------------------------
-    void RenderGBuffer(ulong mainPass)
+    void RenderGBuffer(ulong mainPass, bool lightsOn)
     {
         Transition(gbufPos, ResourceStates.RenderTarget);
         Transition(gbufNrm, ResourceStates.RenderTarget);
@@ -1121,11 +886,14 @@ public sealed unsafe class Renderer : IDisposable
         SetViewport(Width, Height);
         cl.SetPipelineState(psoGBuffer);
         cl.SetGraphicsRootConstantBufferView(2, mainPass);
-        DrawScene(_ => true, true);
+        DrawScene(_ => true, lightsOn);
         Transition(gbufPos, ResourceStates.AllShaderResource);
         Transition(gbufNrm, ResourceStates.AllShaderResource);
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Stage 3: path tracing + denoiser
+    // ---------------------------------------------------------------------------------------------
     void RenderPathTrace(RenderSettings s, int fi, bool hybrid)
     {
         int cur = (int)(frameCounter & 1), prev = 1 - cur;
@@ -1147,7 +915,7 @@ public sealed unsafe class Renderer : IDisposable
         Transition(ptMom[prev], ResourceStates.AllShaderResource);
         Transition(ptHist[cur], ResourceStates.UnorderedAccess);
         Transition(ptMom[cur], ResourceStates.UnorderedAccess);
-        uint maxHistory = s.LightsAnimating ? 12u : 4096u;
+        uint maxHistory = s.LightsAnimating && s.LightsOn ? 12u : 4096u;
         uint reset = historyValid ? 0u : 1u;
         cl.SetPipelineState(psoTemporal);
         RootConstants(true, (uint)ptNoisy.Srv, (uint)ptGuide[cur].Srv, (uint)ptGuide[prev].Srv, (uint)ptHist[prev].Srv,
@@ -1249,7 +1017,8 @@ public sealed unsafe class Renderer : IDisposable
         WaitIdle();
         ReleaseSizeDependent();
         DisposePipelines();
-        foreach (var d in new IDisposable[] { shadowMap, probes[0], probes[1], probeDepth, hud, meshSdf, vb, ib, matBuf, sdfBuf, blasStatic, blasGlass, blasSphere, blasMesh, tlas, tlasScratch, queryHeap, queryReadback })
+        foreach (var g in sceneGpus.Values) g.Dispose();
+        foreach (var d in new IDisposable[] { shadowMap, probes[0], probes[1], probeDepth, hud, queryHeap, queryReadback })
             d?.Dispose();
         foreach (var r in rings) r.Dispose();
         foreach (var a in allocators) a.Dispose();

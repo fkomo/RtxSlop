@@ -4,6 +4,7 @@
 //  - multiple importance sampling (power heuristic) between light and BSDF sampling
 //  - Russian roulette
 //  - smooth glass (Fresnel reflect/refract, Beer-Lambert absorption) - caustics emerge naturally
+//  - sky light (paths escaping to the sky), textures with ray-cone LOD, alpha-tested foliage
 //  - writes albedo-demodulated radiance + "primary surface replacement" guides for the denoiser
 //    (for mirror pixels the guides describe the surface seen *in* the mirror, like in Portal RTX)
 // Root constants: rc0 = radiance UAV, rc1 = guide UAV (normal.xyz, virtual distance), rc2 = albedo UAV,
@@ -124,7 +125,6 @@ bool SampleSphereLight(uint li, float3 P, float2 u, out float3 dir, out float pd
 // Scene intersection: traced ray, or (hybrid mode, depth 0) the rasterized G-buffer
 // ---------------------------------------------------------------------------------------------
 #define NO_GBUFFER 0xFFFFFFFFu
-#define GBUF_LIGHT_CODE 1024u
 
 struct SceneHit
 {
@@ -148,24 +148,27 @@ SceneHit Intersect(float3 o, float3 d)
 }
 
 // Primary visibility from the raster pass: no ray is traced, dir is the camera -> surface direction.
+// The G-buffer stores the triangle; everything else (uv, material, sky visibility) is rebuilt from it.
 SceneHit FromGBuffer(uint2 id, out float3 dir)
 {
     Texture2D<float4> gPos = ResourceDescriptorHeap[rc3];
     Texture2D<float4> gNrm = ResourceDescriptorHeap[rc4];
     float4 p = gPos[id];
     float4 n = gNrm[id];
-    uint code = (uint)(n.w + 0.5);
     SceneHit r = (SceneHit)0;
     r.hit = p.w > 0;
     float3 v = p.xyz - gCamPos;
     r.t = length(v);
     dir = r.hit ? v / r.t : CameraRayDir(id + 0.5);
-    r.isLight = code >= GBUF_LIGHT_CODE;
-    r.light = code - GBUF_LIGHT_CODE;
+    if (!r.hit) return r;
+    r.isLight = n.w < 0;
+    if (r.isLight) { r.light = (uint)(-n.w - 0.5); return r; }
+    uint tri = (uint)(n.w + 0.5);
+    StructuredBuffer<Vertex> vb = ResourceDescriptorHeap[gVbIndex];
+    StructuredBuffer<uint> ib = ResourceDescriptorHeap[gIbIndex];
+    float3 w = Barycentrics(p.xyz, vb[ib[tri * 3]].pos, vb[ib[tri * 3 + 1]].pos, vb[ib[tri * 3 + 2]].pos);
+    r.s = TriangleSurface(tri, w, dir);
     r.s.pos = p.xyz;
-    r.s.N = n.xyz;
-    r.s.material = code;
-    r.s.front = true;   // the camera is outside
     return r;
 }
 
@@ -209,7 +212,7 @@ void CS_PathTrace(uint2 id : SV_DispatchThreadID)
             if (h.isLight) { guideN = -d; guideAlbedo = tint; break; }
             Surface s = h.s;
             Material m = LoadMaterial(s.material);
-            float3 albedo = MaterialAlbedo(m, s.pos);
+            float3 albedo = MaterialAlbedoLod(m, s.pos, s.uv, TextureLod(m, s, guideDist * gPixelSpread, d));
             guideN = s.N;
             guideAlbedo = tint * albedo;
             bool glass = m.type == MAT_GLASS;
@@ -242,6 +245,7 @@ void CS_PathTrace(uint2 id : SV_DispatchThreadID)
         float prevPdf = 0;
         float3 prevPos = o;
         bool afterRough = false;
+        float coneWidth = 0, spread = gPixelSpread;   // ray cone for texture LOD
 
 
         for (uint depth = 0; depth <= gMaxBounces; depth++)
@@ -250,7 +254,14 @@ void CS_PathTrace(uint2 id : SV_DispatchThreadID)
             SceneHit h;
             if (depth == 0 && hybrid) h = FromGBuffer(id, d);
             else h = Intersect(o, d);
-            if (!h.hit) break;
+            if (!h.hit)
+            {
+                // escaped to the sky (not light-sampled, so the BSDF sample gets the full weight)
+                float3 c = throughput * SkyRadiance(d);
+                L += afterRough ? ClampLum(c, 10) : c;
+                break;
+            }
+            coneWidth += spread * h.t;
 
             if (h.isLight)
             {
@@ -269,7 +280,7 @@ void CS_PathTrace(uint2 id : SV_DispatchThreadID)
 
             Surface s = h.s;
             Material m = LoadMaterial(s.material);
-            float3 albedo = MaterialAlbedo(m, s.pos);
+            float3 albedo = MaterialAlbedoLod(m, s.pos, s.uv, TextureLod(m, s, coneWidth, d));
             float3 V = -d;
             float3 P = OffsetRay(s.pos, s.N);
 
@@ -315,6 +326,7 @@ void CS_PathTrace(uint2 id : SV_DispatchThreadID)
             if (!SampleBSDF(s.N, V, albedo, m, u, newDir, weight, pdf)) break;
             throughput *= weight;
             afterRough = afterRough || m.roughness > 0.2;
+            if (m.roughness > 0.2) spread = max(spread, 0.05);   // diffuse bounce: wide cone
             prevPdf = pdf;
             prevPos = P;
             o = P;

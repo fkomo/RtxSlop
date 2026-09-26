@@ -21,14 +21,12 @@ public sealed class Camera
     }
 
     /// <summary>Walk on the XZ plane (move.X = strafe, move.Y = up/down, move.Z = forward).</summary>
-    public void Move(Vector3 move, float dt, float speed)
+    public void Move(Vector3 move, float dt, float speed, Vector3 boundsMin, Vector3 boundsMax)
     {
         var flatFwd = Vector3.Normalize(new Vector3(MathF.Sin(Yaw), 0, MathF.Cos(Yaw)));
         var delta = (Right * move.X + Vector3.UnitY * move.Y + flatFwd * move.Z) * speed * dt;
         Position += delta;
-        // stay inside the room
-        Position.X = Math.Clamp(Position.X, -Scene.HalfX + 0.25f, Scene.HalfX - 0.25f);
-        Position.Z = Math.Clamp(Position.Z, -Scene.HalfZ + 0.25f, Scene.HalfZ - 0.25f);
-        Position.Y = Math.Clamp(Position.Y, 0.3f, Scene.Height - 0.2f);
+        // stay inside the scene
+        Position = Vector3.Clamp(Position, boundsMin, boundsMax);
     }
 }

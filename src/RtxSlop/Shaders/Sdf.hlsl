@@ -1,6 +1,8 @@
 // Stage 5: signed distance field ray marching (sphere tracing) - no triangles, no rasterizer, no RT cores.
 // The room is ~20 analytic primitives (half-spaces, rotated boxes, spheres) evaluated per step, plus the
-// loaded mesh as a baked 3D distance texture (see SdfBake.hlsl).
+// model as a baked 3D distance texture (see SdfBake.hlsl). Sponza is nothing but one big baked mesh grid.
+// Mesh hits are shaded with the exact nearest triangle (stored per voxel by the bake): uv, normal,
+// material and sky visibility come from the triangle, only visibility comes from the distance field.
 //  - sphere tracing for primary and reflection rays (mirrors, metals, polished floor)
 //  - soft shadows from the SDF itself (penumbra estimated from the closest miss distance)
 //  - ambient occlusion by sampling the distance field along the normal
@@ -28,25 +30,30 @@ struct SdfPrim
 #define SDF_MESH   3u
 #define LIGHT_MAT  0x10000u      // material ids >= this are light bulb (LIGHT_MAT + index)
 
-float MeshBoxDistance(float3 p) { return length(p - clamp(p, gMeshSdfMin, gMeshSdfMax)); }
+// Mesh prims: center/size = grid bounds, cosR/sinR = bit-cast SRVs of the distance / triangle-id grids,
+// pad.x = bit-cast flags (bit 0 = signed), pad.y = voxel size.
+float MeshBoxDistance(SdfPrim pr, float3 p) { return length(max(abs(p - pr.center) - pr.size, 0)); }
 
 // Baked mesh: distance to the grid box + trilinear sample at the closest point in the box. The 0.9 keeps
 // sphere tracing conservative (trilinear interpolation can overestimate slightly near thin features).
 // Far away just the box distance - the switch happens where it no longer matters for soft shadows.
-float MeshDistance(float3 p)
+// Unsigned grids (open architecture) become a thin shell: surfaces are where the distance < 0.6 voxel.
+float MeshDistance(SdfPrim pr, float3 p)
 {
-    float3 q = clamp(p, gMeshSdfMin, gMeshSdfMax);
+    float3 bmin = pr.center - pr.size, bmax = pr.center + pr.size;
+    float3 q = clamp(p, bmin, bmax);
     float outside = length(p - q);
     if (outside > 1.0) return outside;
-    Texture3D<float> sdf = ResourceDescriptorHeap[gMeshSdfIndex];
-    float d = sdf.SampleLevel(sLinear, (q - gMeshSdfMin) / (gMeshSdfMax - gMeshSdfMin), 0);
+    Texture3D<float> sdf = ResourceDescriptorHeap[asuint(pr.cosR)];
+    float d = sdf.SampleLevel(sLinear, (q - bmin) / (bmax - bmin), 0);
+    if ((asuint(pr.pad.x) & 1) == 0) d -= 0.6 * pr.pad.y;
     return outside + 0.9 * d;
 }
 
 float PrimDistance(SdfPrim pr, float3 p)
 {
     if (pr.type == SDF_PLANE) return dot(p, pr.size) + pr.center.x;
-    if (pr.type == SDF_MESH) return MeshDistance(p);
+    if (pr.type == SDF_MESH) return MeshDistance(pr, p);
     float3 w = p - pr.center;
     if (pr.type == SDF_SPHERE) return length(w) - pr.size.x;
     // box rotated around Y: bring p into the box's local frame
@@ -58,6 +65,7 @@ float PrimDistance(SdfPrim pr, float3 p)
 #define MAX_PRIMS 64
 groupshared SdfPrim gsPrims[MAX_PRIMS];
 groupshared uint gsGlass[MAX_PRIMS];   // 1 = the primitive's material is glass
+groupshared uint gsShellBits;          // thickest unsigned-grid shell (asuint), 0 without open meshes
 #define NO_PRIM 0xFFFFFFFFu
 
 struct MapResult { float d; uint mat; bool mesh; uint prim; };
@@ -74,7 +82,7 @@ MapResult Map(float3 p, bool withLights, bool withPlanes = false, bool excludeGl
     {
         if (excludeGlass && gsGlass[i] != 0) continue;
         bool isMesh = gsPrims[i].type == SDF_MESH;
-        if (isMesh && MeshBoxDistance(p) >= r.d) continue;   // skip the texture lookup when it can't win
+        if (isMesh && MeshBoxDistance(gsPrims[i], p) >= r.d) continue;   // skip the texture lookup when it can't win
         float d = PrimDistance(gsPrims[i], p);
         if (d < r.d) { r.d = d; r.mat = gsPrims[i].material; r.mesh = isMesh; r.prim = i; }
     }
@@ -116,7 +124,8 @@ bool March(float3 o, float3 d, out float t, out uint mat, out bool hitPlane, out
     t = 0.0;
     // hit threshold grows with distance ~ half a pixel footprint
     uint lastMat = 0;
-    for (int i = 0; i < 160 && t < tMax; i++)
+    const float tFar = 200;   // open scenes: rays escape to the sky
+    for (int i = 0; i < 192 && t < tMax && t < tFar; i++)
     {
         MapResult m = Map(o + d * t, true);
         if (m.d < 1e-4 + 6e-4 * t) { mat = m.mat; hitMesh = m.mesh; prim = m.prim; return true; }
@@ -127,7 +136,7 @@ bool March(float3 o, float3 d, out float t, out uint mat, out bool hitPlane, out
     }
     // Out of steps while still in front of the wall = ray grazing an edge: it is right next to that
     // surface, so take it (falling through to the wall behind would draw streaks along edges).
-    if (t < tMax) { mat = lastMat; return true; }
+    if (t < tMax && t < tFar) { mat = lastMat; return true; }
     hitMesh = false;
     prim = NO_PRIM;
     if (tMax < 1e9) { t = tMax; hitPlane = true; return true; }
@@ -147,19 +156,51 @@ float MarchInside(uint prim, float3 o, float3 d)
     return t;
 }
 
-float3 MeshNormal(float3 p)
+float3 MeshNormal(SdfPrim pr, float3 p)
 {
     // gradient over about half a voxel: smooths the piecewise-trilinear field
-    float3 voxel = (gMeshSdfMax - gMeshSdfMin) / 128.0;
     const float2 k = float2(1, -1);
-    float h = 0.5 * max(voxel.x, max(voxel.y, voxel.z));
-    return normalize(k.xyy * MeshDistance(p + k.xyy * h) + k.yyx * MeshDistance(p + k.yyx * h) +
-                     k.yxy * MeshDistance(p + k.yxy * h) + k.xxx * MeshDistance(p + k.xxx * h));
+    float h = 0.5 * pr.pad.y;
+    return normalize(k.xyy * MeshDistance(pr, p + k.xyy * h) + k.yyx * MeshDistance(pr, p + k.yyx * h) +
+                     k.yxy * MeshDistance(pr, p + k.yxy * h) + k.xxx * MeshDistance(pr, p + k.xxx * h));
+}
+
+// Exact surface for a mesh hit: the nearest of the triangles stored in the 8 voxels around p.
+bool MeshSurface(SdfPrim pr, float3 p, float3 d, out Surface s)
+{
+    s = (Surface)0;
+    Texture3D<uint> triIds = ResourceDescriptorHeap[asuint(pr.sinR)];
+    uint3 dims;
+    triIds.GetDimensions(dims.x, dims.y, dims.z);
+    float3 bmin = pr.center - pr.size;
+    int3 base = (int3)floor((p - bmin) / (2 * pr.size) * float3(dims) - 0.5);
+    StructuredBuffer<Vertex> vb = ResourceDescriptorHeap[gVbIndex];
+    StructuredBuffer<uint> ib = ResourceDescriptorHeap[gIbIndex];
+    float best = 1e30;
+    uint bestTri = 0;
+    float3 bestCp = p;
+    [unroll] for (int k = 0; k < 8; k++)
+    {
+        int3 v = clamp(base + int3(k & 1, (k >> 1) & 1, k >> 2), 0, int3(dims) - 1);
+        uint code = triIds.Load(int4(v, 0));
+        if (code == 0) continue;
+        uint tri = code - 1;
+        float3 a = vb[ib[tri * 3]].pos, b = vb[ib[tri * 3 + 1]].pos, c = vb[ib[tri * 3 + 2]].pos;
+        float3 cp = ClosestPointOnTriangle(p, a, b, c);
+        float dist = length(cp - p);
+        if (dist < best) { best = dist; bestTri = code; bestCp = cp; }
+    }
+    if (bestTri == 0) return false;
+    uint tri = bestTri - 1;
+    float3 w = Barycentrics(bestCp, vb[ib[tri * 3]].pos, vb[ib[tri * 3 + 1]].pos, vb[ib[tri * 3 + 2]].pos);
+    s = TriangleSurface(tri, saturate(w), d);
+    s.pos = bestCp;
+    return true;
 }
 
 float3 PrimNormal(uint prim, float3 p)
 {
-    if (gsPrims[prim].type == SDF_MESH) return MeshNormal(p);
+    if (gsPrims[prim].type == SDF_MESH) return MeshNormal(gsPrims[prim], p);
     const float2 k = float2(1, -1);
     const float h = 5e-4;
     SdfPrim pr = gsPrims[prim];
@@ -250,14 +291,15 @@ float SoftShadow(float3 o, float3 L, float maxT, float k, bool excludeGlass = fa
 
 float AmbientOcclusion(float3 p, float3 n)
 {
-    uint2 mask = PrimsNearPoint(p, 0.25);
+    float shell = asfloat(gsShellBits);
+    uint2 mask = PrimsNearPoint(p, 0.25 + shell);
     float occ = 0.0;
     float sca = 1.0;
     for (int i = 0; i < 5; i++)
     {
         float h = 0.02 + 0.15 * i / 4.0;
-        float3 q = p + n * h;
-        float d = MapMasked(q, mask);
+        float3 q = p + n * (h + shell);
+        float d = MapMasked(q, mask) + shell;   // unsigned grids read 'distance - shell'
         for (uint j = 0; j < rc4; j++) d = min(d, PrimDistance(gsPrims[j], q));   // room half-spaces
         occ += (h - d) * sca;
         sca *= 0.9;
@@ -269,7 +311,8 @@ float AmbientOcclusion(float3 p, float3 n)
 // (same cheat as the Whitted ray tracer).
 float3 LightShadow(float3 p, float3 N, uint li)
 {
-    float3 P = p + N * 0.01;
+    // start outside the thin shell of unsigned (open mesh) grids, or the ray is 'inside' from the start
+    float3 P = p + N * (0.01 + 1.5 * asfloat(gsShellBits));
     float3 Lv = gLights[li].pos - P;
     float dist = length(Lv);
     float3 L = Lv / dist;
@@ -329,6 +372,7 @@ struct RayTask
     float3 throughput;
     uint depth;
     uint inside;   // glass primitive the ray travels inside of, or NO_PRIM
+    float dist;    // distance travelled so far (ray cone width for texture LOD)
 };
 
 #define MAX_STACK 8
@@ -344,6 +388,7 @@ float3 TracePixel(float2 pixel)
     first.throughput = 1;
     first.depth = 0;
     first.inside = NO_PRIM;
+    first.dist = 0;
     stack[sp++] = first;
     float3 radiance = 0;
 
@@ -353,37 +398,53 @@ float3 TracePixel(float2 pixel)
         float3 o = r.o, d = r.d;
         float t;
         uint mat;
-        float3 N;
-        bool front = true;
         bool onMesh;
         uint prim = r.inside;
+        bool front = r.inside == NO_PRIM;
 
         if (r.inside != NO_PRIM)
         {
             t = MarchInside(r.inside, o, d);
-            N = -PrimNormal(r.inside, o + d * t);   // outward normal flipped to face the ray
             mat = gsPrims[r.inside].material;
-            front = false;
             onMesh = gsPrims[r.inside].type == SDF_MESH;
         }
         else
         {
             bool onPlane;
             float3 planeN;
-            if (!March(o, d, t, mat, onPlane, planeN, onMesh, prim)) continue;
+            if (!March(o, d, t, mat, onPlane, planeN, onMesh, prim))
+            {
+                radiance += r.throughput * SkyRadiance(d);
+                continue;
+            }
             if (mat >= LIGHT_MAT)
             {
                 radiance += r.throughput * LightEmission(mat - LIGHT_MAT);
                 continue;
             }
-            float3 hp = o + d * t;
-            N = onPlane ? planeN : (onMesh ? MeshNormal(hp) : SdfNormal(hp));
-            if (dot(N, d) > 0) N = -N;
+            if (onPlane) prim = NO_PRIM;
         }
 
+        // surface: exact triangle data for mesh hits, analytic otherwise
         float3 p = o + d * t;
-        Material m = LoadMaterial(mat);
-        float3 albedo = MaterialAlbedo(m, p);
+        Surface s = (Surface)0;
+        s.pos = p;
+        s.material = mat;
+        s.skyVis = 1;
+        bool haveTri = onMesh && prim != NO_PRIM && MeshSurface(gsPrims[prim], p, d, s);
+        if (!haveTri)
+        {
+            float3 N;
+            if (prim == NO_PRIM) { uint pm; float3 pn; IntersectPlanes(o, d, pm, pn); N = pn; }
+            else N = PrimNormal(prim, p);
+            s.N = dot(N, d) > 0 ? -N : N;
+        }
+        if (!front) s.N = dot(s.N, d) > 0 ? -s.N : s.N;   // inside the glass: normal faces the ray too
+        float dist = r.dist + t;
+        Material m = LoadMaterial(s.material);
+        float3 albedo = haveTri ? MaterialAlbedoLod(m, s.pos, s.uv, TextureLod(m, s, dist * gPixelSpread, d)) : MaterialAlbedo(m, s.pos);
+        float3 N = s.N;
+        p = s.pos;
         float3 V = -d;
         // glass gets extra depth: thin parts bounce light around inside a few times
         bool canRecurse = r.depth < gMaxBounces + (m.type == MAT_GLASS ? 4u : 0u);
@@ -397,6 +458,7 @@ float3 TracePixel(float2 pixel)
             float F = FresnelDielectric(saturate(dot(N, V)), eta);
             RayTask c;
             c.depth = r.depth + 1;
+            c.dist = dist;
             if (F < 1.0 && sp < MAX_STACK)
             {
                 c.o = p - N * 2e-3;
@@ -424,8 +486,9 @@ float3 TracePixel(float2 pixel)
             if (any(c > 0)) c *= LightShadow(p, N, li);
             direct += c;
         }
-        // stronger ambient than the other modes so the SDF ambient occlusion is visible
-        direct += 2.5 * gAmbient * albedo * (1.0 - m.metallic) * AmbientOcclusion(p, N);
+        // ambient x SDF ambient occlusion (the room's constant fill is boosted so the AO is visible)
+        float3 ambient = 2.5 * gAmbient + SkyAmbient(N) * SkyOcclusion(s.skyVis);
+        direct += ambient * albedo * (1.0 - m.metallic) * AmbientOcclusion(p, N);
         radiance += r.throughput * direct;
 
         if (reflective && sp < MAX_STACK)
@@ -437,6 +500,7 @@ float3 TracePixel(float2 pixel)
             c.throughput = r.throughput * F;
             c.depth = r.depth + 1;
             c.inside = NO_PRIM;
+            c.dist = dist;
             if (max(c.throughput.r, max(c.throughput.g, c.throughput.b)) > 0.01)
                 stack[sp++] = c;
         }
@@ -451,10 +515,15 @@ static const float2 kRotatedGrid[4] = { float2(0.375, 0.125), float2(0.875, 0.37
 void CS_Sdf(uint2 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 {
     StructuredBuffer<SdfPrim> prims = ResourceDescriptorHeap[rc1];
+    if (gi == 0) gsShellBits = 0;
+    GroupMemoryBarrierWithGroupSync();
     if (gi < min(rc2, MAX_PRIMS))
     {
-        gsPrims[gi] = prims[gi];
-        gsGlass[gi] = LoadMaterial(prims[gi].material).type == MAT_GLASS ? 1u : 0u;
+        SdfPrim pr = prims[gi];
+        gsPrims[gi] = pr;
+        gsGlass[gi] = LoadMaterial(pr.material).type == MAT_GLASS ? 1u : 0u;
+        if (pr.type == SDF_MESH && (asuint(pr.pad.x) & 1) == 0)
+            InterlockedMax(gsShellBits, asuint(0.6 * pr.pad.y));   // positive floats order like uints
     }
     GroupMemoryBarrierWithGroupSync();
     if (any(id >= (uint2)gScreenSize)) return;

@@ -3,6 +3,7 @@
 //  - exact hard shadows: one shadow ray per light
 //  - recursive mirror reflections (mirror <-> mirror "infinite" corridor, chrome sphere, polished floor)
 //  - glass: Fresnel-weighted reflection + refraction rays, Beer-Lambert absorption, tinted shadows
+//  - textures filtered with ray cones, alpha-tested foliage, sky + baked sky visibility as ambient
 // Root constants: rc0 = output UAV (HDR), rc1 = rays per pixel (1 or 4, rotated grid SSAA)
 
 #include "Common.hlsli"
@@ -18,6 +19,7 @@ struct RayTask
     float3 d;
     float3 throughput;
     uint depth;
+    float dist;   // distance travelled so far (ray cone width for texture LOD)
 };
 
 #define MAX_STACK 8
@@ -32,6 +34,7 @@ float3 TracePixel(float2 pixel)
     first.d = CameraRayDir(pixel);
     first.throughput = 1;
     first.depth = 0;
+    first.dist = 0;
     stack[sp++] = first;
     float3 radiance = 0;
 
@@ -39,7 +42,11 @@ float3 TracePixel(float2 pixel)
     {
         RayTask r = stack[--sp];
         Hit h = TraceClosest(r.o, r.d, 0xFF);
-        if (!h.hit) continue;
+        if (!h.hit)
+        {
+            radiance += r.throughput * SkyRadiance(r.d);
+            continue;
+        }
         if (IsLightInstance(h.instance))
         {
             radiance += r.throughput * LightEmission(h.instance - 1);
@@ -48,7 +55,8 @@ float3 TracePixel(float2 pixel)
 
         Surface s = GetSurface(h, r.o, r.d);
         Material m = LoadMaterial(s.material);
-        float3 albedo = MaterialAlbedo(m, s.pos);
+        float dist = r.dist + h.t;
+        float3 albedo = MaterialAlbedoLod(m, s.pos, s.uv, TextureLod(m, s, dist * gPixelSpread, r.d));
         float3 V = -r.d;
         // glass gets extra depth: thin parts bounce light around inside a few times
         bool canRecurse = r.depth < gMaxBounces + (m.type == MAT_GLASS ? 4u : 0u);
@@ -62,6 +70,7 @@ float3 TracePixel(float2 pixel)
             float F = FresnelDielectric(saturate(dot(s.N, V)), eta);
             RayTask t;
             t.depth = r.depth + 1;
+            t.dist = dist;
             if (F < 1.0 && sp < MAX_STACK)
             {
                 t.o = s.pos - s.N * 1e-3;
@@ -92,7 +101,7 @@ float3 TracePixel(float2 pixel)
                 direct += c * ShadowTransmittance(P, Lv / dist, dist - gLights[li].radius);
             }
         }
-        direct += gAmbient * albedo * (1.0 - m.metallic);
+        direct += AmbientLight(s.N, s.skyVis) * albedo * (1.0 - m.metallic);
         radiance += r.throughput * direct;
 
         if (reflective && sp < MAX_STACK)
@@ -103,6 +112,7 @@ float3 TracePixel(float2 pixel)
             t.d = reflect(r.d, s.N);
             t.throughput = r.throughput * F;
             t.depth = r.depth + 1;
+            t.dist = dist;
             if (max(t.throughput.r, max(t.throughput.g, t.throughput.b)) > 0.01)
                 stack[sp++] = t;
         }

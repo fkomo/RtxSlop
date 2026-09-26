@@ -16,6 +16,7 @@ public sealed class RenderSettings
     public float Exposure = 1.0f;
     public bool VSync = false;
     public bool LightsAnimating = true;
+    public bool LightsOn = true;           // off: only the sky (Sponza) / ambient (room) lights the scene
     public bool AntiAliasing = true;   // 4x MSAA (raster) / 4x SSAA (ray tracing)
     public bool SdfAntiAliasing = false;   // 4x SSAA for the SDF marcher (~5x the cost, so off by default)
 }
@@ -37,8 +38,9 @@ public struct FrameData
     public uint ShadowIndex, ProbeIndex, StaticIndexCount, MeshFirstIndex;
     public Vector3 ProbePos; public float ShadowNear;
     public float ShadowFar; public uint MeshMaterial, MeshSdfIndex, GlassFirstIndex;
-    public Vector3 MeshSdfMin; public float Pad2;
-    public Vector3 MeshSdfMax; public float Pad3;
+    public Vector3 MeshSdfMin; public float SkyIntensity;
+    public Vector3 MeshSdfMax; public uint AlphaFirstIndex;
+    public float PixelSpread; public uint BakeFlags; public Vector2 Pad4;
 }
 
 /// <summary>Layout must match PassCB in Common.hlsli.</summary>
@@ -46,6 +48,7 @@ public struct FrameData
 public struct PassData
 {
     public Matrix4x4 ViewProj;
+    public Matrix4x4 InvViewProj;
     public Vector3 CamPos; public uint Flags;
     public Vector4 ClipPlane;
 
@@ -82,7 +85,7 @@ public sealed class GpuTexture : IDisposable
     public ResourceStates State;
     public int Srv = -1, Uav = -1;
     public CpuDescriptorHandle Rtv, Dsv;
-    public int Width, Height;
+    public int Width, Height, Depth = 1;
 
     public void Dispose()
     {
