@@ -8,8 +8,8 @@
 //  - writes albedo-demodulated radiance + "primary surface replacement" guides for the denoiser
 //    (for mirror pixels the guides describe the surface seen *in* the mirror, like in Portal RTX)
 // Root constants: rc0 = radiance UAV, rc1 = guide UAV (normal.xyz, virtual distance), rc2 = albedo UAV,
-//                 rc3/rc4 = G-buffer SRVs (position / normal+material) for hybrid mode, or NO_GBUFFER
-//                 to trace primary rays too.
+//                 rc3/rc4 = G-buffer SRVs (position / normal+triangle), rc5/rc6 = final ReSTIR reservoir SRVs,
+//                 rc7 = 0 PT, 1 PT + ReSTIR DI, 2 hybrid + ReSTIR DI, 3 hybrid (hybrid: depth 0 from the G-buffer)
 
 #include "Common.hlsli"
 
@@ -88,9 +88,13 @@ float OneMinusCosMax(float r2, float d2)
     return s2 / (1.0 + sqrt(max(0, 1.0 - s2)));   // numerically stable 1 - sqrt(1 - s2)
 }
 
+// With a handful of lights every vertex samples all of them; with many, one is picked uniformly.
+uint NeeLightCount() { return gNumLights <= 4 ? gNumLights : 1; }
+float LightSelectProb() { return gNumLights <= 4 ? 1.0 : 1.0 / gNumLights; }
+
 float SphereLightPdf(uint li, float3 P)
 {
-    Light Lt = gLights[li];
+    Light Lt = LoadLight(li);
     float3 wc = Lt.pos - P;
     float d2 = dot(wc, wc);
     float r2 = Lt.radius * Lt.radius;
@@ -100,7 +104,7 @@ float SphereLightPdf(uint li, float3 P)
 
 bool SampleSphereLight(uint li, float3 P, float2 u, out float3 dir, out float pdf, out float tHit)
 {
-    Light Lt = gLights[li];
+    Light Lt = LoadLight(li);
     float3 wc = Lt.pos - P;
     float d2 = dot(wc, wc);
     float r2 = Lt.radius * Lt.radius;
@@ -190,7 +194,8 @@ void CS_PathTrace(uint2 id : SV_DispatchThreadID)
     RWTexture2D<float4> outAlbedo = ResourceDescriptorHeap[rc2];
 
     uint seed = PcgHash(id.x + PcgHash(id.y + PcgHash(gFrameIndex)));
-    bool hybrid = rc3 != NO_GBUFFER;
+    bool hybrid = rc7 >= 2;
+    bool restir = rc7 == 1 || rc7 == 2;
 
     // Denoiser guides: deterministic walk from the pixel center through perfect mirrors
     // ("primary surface replacement"). Using the jittered sample instead would make edge pixels
@@ -237,7 +242,9 @@ void CS_PathTrace(uint2 id : SV_DispatchThreadID)
 
     for (uint sampleIdx = 0; sampleIdx < gSpp; sampleIdx++)
     {
-        float2 jitter = Rand2(seed);   // sub-pixel jitter = free anti-aliasing after accumulation
+        // sub-pixel jitter = free anti-aliasing after accumulation (sample 0 matches the ReSTIR primary G-buffer)
+        float2 jitter = sampleIdx == 0 ? PrimaryJitter(id) : Rand2(seed);
+        bool restirUsed = false;
         float3 o = gCamPos;
         float3 d = CameraRayDir(id + jitter);
         float3 throughput = 1;
@@ -268,9 +275,10 @@ void CS_PathTrace(uint2 id : SV_DispatchThreadID)
                 uint li = h.light;
                 float3 Le = LightEmission(li);
                 float w = 1;
-                if (depth > 0)
+                if (depth == 1 && restirUsed) w = 0;   // ReSTIR already accounted for the primary hit's direct light
+                else if (depth > 0)
                 {
-                    float pl = SphereLightPdf(li, prevPos);
+                    float pl = SphereLightPdf(li, prevPos) * LightSelectProb();
                     w = (prevPdf * prevPdf) / (prevPdf * prevPdf + pl * pl);
                 }
                 float3 c = throughput * Le * w;
@@ -299,13 +307,45 @@ void CS_PathTrace(uint2 id : SV_DispatchThreadID)
                 continue;
             }
 
-            // Next event estimation with MIS
             float alpha = RoughnessToAlpha(m.roughness);
             float pSpec = SpecularProbability(s.N, V, albedo, m);
-            for (uint li = 0; li < gNumLights; li++)
+
+            // Primary hit on a rough surface: direct light from the ReSTIR DI reservoir (one sample, chosen
+            // from many candidates + temporal and spatial neighbours, visibility already tested from this point).
+            bool useRestir = false;
+            if (depth == 0 && sampleIdx == 0 && restir && RestirEligible(m))
             {
+                Texture2D<float4> resA = ResourceDescriptorHeap[rc5];
+                Texture2D<float4> resB = ResourceDescriptorHeap[rc6];
+                float4 a = resA[id];
+                float4 b = resB[id];
+                if (b.x > 0)
+                {
+                    useRestir = true;
+                    restirUsed = true;
+                    uint li = asuint(b.y);
+                    if (a.w > 0 && li < gNumLights)
+                    {
+                        Light Lt = LoadLight(li);
+                        float3 y = Lt.pos + a.xyz * Lt.radius;
+                        float3 wi = y - P;
+                        float d2 = dot(wi, wi);
+                        float dl = sqrt(d2);
+                        wi /= dl;
+                        float cosX = dot(s.N, wi), cosY = dot(a.xyz, -wi);
+                        if (cosX > 0 && cosY > 0)   // W = 0 when CS_RestirSpatial found it occluded from this point
+                            L += EvalBRDF(s.N, V, wi, albedo, m.roughness, m.metallic, 0) * LightEmission(li) * (cosX * cosY / d2) * a.w;
+                    }
+                }
+            }
+
+            // Next event estimation with MIS
+            for (uint ni = 0; ni < NeeLightCount() && !useRestir; ni++)
+            {
+                uint li = gNumLights <= 4 ? ni : min((uint)(Rand(seed) * gNumLights), gNumLights - 1);
                 float3 ldir; float lpdf; float tHit;
                 if (!SampleSphereLight(li, P, Rand2(seed), ldir, lpdf, tHit)) continue;
+                lpdf *= LightSelectProb();
                 float NdotL = dot(s.N, ldir);
                 if (NdotL <= 0) continue;
                 float3 f = EvalBRDF(s.N, V, ldir, albedo, m.roughness, m.metallic, 0);

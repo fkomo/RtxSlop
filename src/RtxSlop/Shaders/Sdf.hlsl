@@ -88,9 +88,11 @@ MapResult Map(float3 p, bool withLights, bool withPlanes = false, bool excludeGl
     }
     if (withLights)
     {
-        for (uint li = 0; li < gNumLights; li++)
+        // only the main bulbs are marched (visible); 128 extra spheres per step would be far too slow
+        for (uint li = 0; li < gShadowedLights; li++)
         {
-            float d = length(p - gLights[li].pos) - gLights[li].radius;
+            Light Lt = LoadLight(li);
+            float d = length(p - Lt.pos) - Lt.radius;
             if (d < r.d) { r.d = d; r.mat = LIGHT_MAT + li; }
         }
     }
@@ -313,12 +315,13 @@ float3 LightShadow(float3 p, float3 N, uint li)
 {
     // start outside the thin shell of unsigned (open mesh) grids, or the ray is 'inside' from the start
     float3 P = p + N * (0.01 + 1.5 * asfloat(gsShellBits));
-    float3 Lv = gLights[li].pos - P;
+    Light Lt = LoadLight(li);
+    float3 Lv = Lt.pos - P;
     float dist = length(Lv);
     float3 L = Lv / dist;
-    float maxT = dist - gLights[li].radius;
+    float maxT = dist - Lt.radius;
     // penumbra sharpness ~ 1 / angular size of the bulb
-    float k = clamp(0.5 * dist / gLights[li].radius, 2.0, 64.0);
+    float k = clamp(0.5 * dist / Lt.radius, 2.0, 64.0);
     float opaque = SoftShadow(P, L, maxT, k, true);
     if (opaque <= 0) return 0;
 
@@ -483,7 +486,7 @@ float3 TracePixel(float2 pixel)
         for (uint li = 0; li < gNumLights; li++)
         {
             float3 c = ShadePointLight(li, p, N, V, albedo, m, !reflective);
-            if (any(c > 0)) c *= LightShadow(p, N, li);
+            if (any(c > 0) && li < gShadowedLights) c *= LightShadow(p, N, li);   // the many small lights: unshadowed
             direct += c;
         }
         // ambient x SDF ambient occlusion (the room's constant fill is boosted so the AO is visible)

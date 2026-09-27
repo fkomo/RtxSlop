@@ -20,7 +20,7 @@ There are five scenes (`F1`–`F5`):
 4. **San Miguel**: the San Miguel 2.1 courtyard (`data/san_miguel`, low-poly version: 5.6M triangles, 220 textures, lots of alpha-tested foliage) with the dragon between the fountain and the trees. The foliage masks live in the base color's alpha channel, and the one translucent material (`d < 1`) becomes glass.
 5. **San Miguel (full)**: the same courtyard from the full-detail `san-miguel.obj` (1.1 GB, 10M triangles). It looks nearly identical at normal viewing distances, but it shows how the modes scale: ray and path tracing cost about the same as with 5.6M triangles (BVH traversal is roughly logarithmic), while rasterization, which draws every triangle in every pass, gets about 60% slower.
 
-Every scene has three moving colored sphere lights. `K` switches them off; in the open-air scenes you then see only sky light.
+Every scene has three moving colored sphere lights. `K` switches them off; in the open-air scenes you then see only sky light. `J` adds 128 small drifting lights (131 in total). That is the case ReSTIR DI (`T`) is made for.
 
 ## Gallery
 
@@ -45,6 +45,10 @@ All images are straight captures from the app (`--capture`) at 1600×900 on an R
 **The model's materials** (`G`): jade, glass, gold and mirror in raster, ray tracing, path tracing and SDF.
 
 ![Dragon materials across the modes](docs/images/materials.jpg)
+
+**Many lights and ReSTIR DI (`J`, `T`).** With 131 lights, plain next event estimation picks one light at random per bounce, so most of the time it picks a far-away or occluded one. ReSTIR DI (reservoir spatiotemporal importance resampling) resamples 32 light candidates per pixel. It then reuses the winners of the previous frame and of 5 neighbour pixels, so every primary hit shades with one well-chosen, shadow-tested light sample. At about 1.5–2.5 ms per frame, a single frame looks close to a converged image.
+
+![NEE versus ReSTIR DI with 131 lights](docs/images/restir.jpg)
 
 **Lights off (`K`).** Only the sky remains. Raster uses baked per-vertex sky visibility plus a small bounce term; the path tracer gets real multi-bounce sky light.
 
@@ -77,6 +81,8 @@ The shaders are compiled at startup with DXC, which the NuGet package ships. You
 | `G` | Cycle the model's material: jade (diffuse), glass, gold, mirror |
 | `F1`–`F5` | Scene: room / Crytek Sponza / Dabrovic Sponza / San Miguel / San Miguel full (loaded on first use; the very first San Miguel load parses the OBJ for 5–8 s, later loads use the cache) |
 | `K` | Lights on / off (off = sky light only) |
+| `J` | Many lights: +128 small drifting lights (unshadowed in raster and SDF; only the 3 main lights have shadow maps / soft shadows) |
+| `T` | ReSTIR DI on / off for the direct light of path-traced primary hits (modes 3 and 4) |
 | `B` / `N` | Fewer / more bounces (all modes except raster) |
 | `+` / `-` | Path tracer samples per pixel |
 | `F` | Denoiser on / off |
@@ -107,7 +113,7 @@ A Wavefront `.obj` model sits in the middle of the room. By default it is `data/
 - **Sky:** a horizon-to-zenith gradient. The path tracer gets sky light (and its bounces) for free. For the other modes, the sky visibility of every vertex is baked once on the GPU with ray queries (64 rays per vertex) and used as ambient occlusion, plus a small constant for light bounced around the building.
 - **SDF mode in Sponza:** the whole building is baked into one *unsigned* distance grid of about 10 cm voxels, since open architecture has no inside. The bake also stores the nearest triangle per voxel, so SDF hits are shaded with the exact triangle's UV, normal, material and sky visibility. Visibility is still voxel-coarse, which shows on foliage.
 
-Command-line flags: `--sponza` starts in Sponza. `--debug` enables the D3D12 debug layer (it needs the Windows "Graphics Tools" optional feature). `--capture <dir>` renders fixed viewpoints in every mode, saves PNGs and timings, then exits. `--bench <dir>` only measures GPU time per scene, mode and model material (`bench.txt`). `--capture <dir> --scenes 1,3` limits the capture to some scenes (0 = room ... 4 = San Miguel full).
+Command-line flags: `--sponza` starts in Sponza. `--debug` enables the D3D12 debug layer (it needs the Windows "Graphics Tools" optional feature). `--capture <dir>` renders fixed viewpoints in every mode, saves PNGs and timings, then exits. `--bench <dir>` only measures GPU time per scene, mode and model material (`bench.txt`). `--capture <dir> --scenes 1,3` limits the capture to some scenes (0 = room ... 4 = San Miguel full). `--capture <dir> --restir` only captures the many-lights comparison (NEE vs ReSTIR DI: single frame, moving lights, converged) and its timings.
 
 ## Architecture
 
@@ -126,6 +132,7 @@ src/RtxSlop/
     RayTrace.hlsl  Whitted-style compute shader (RayQuery)
     Sdf.hlsl       sphere tracing, SDF soft shadows and AO
     PathTrace.hlsl path tracer compute shader (RayQuery); reads the G-buffer for depth 0 in hybrid mode
+    Restir.hlsl    ReSTIR DI: initial candidates + temporal reuse, spatial reuse (before the path tracer)
     Denoise.hlsl   temporal accumulation and à-trous wavelet filter
     Post.hlsl      ACES tonemap and HUD composite
 ```
@@ -133,4 +140,5 @@ src/RtxSlop/
 - **Bindless:** Everything uses one root signature: 8 root constants, a frame CBV and a pass CBV. Resources are read through SM 6.6 `ResourceDescriptorHeap[]`, and vertices are fetched from structured buffers, so there are no input layouts or descriptor tables.
 - **Shared scene data:** The rasterizer and both ray tracers read the same vertex, index and material buffers and the same BRDF code, which keeps the comparison fair.
 - **Acceleration structures:** There is one BLAS for the static room and one unit-sphere BLAS that each light instances. The TLAS is rebuilt every frame as the lights move. Instance masks keep the light bulbs from blocking shadow rays.
+- **ReSTIR DI:** A light sample is stored as (light index, direction from the light's center to the point on its sphere), so it stays attached to a light that moves. Candidates are drawn in area measure, which lets any pixel reuse them without a Jacobian. Temporal and spatial reuse use the generalized balance heuristic, with each pixel's own target function and a confidence M (history capped at 20× the 32 candidates). Cheaper 1/M weights made surfaces near a light about 5% too bright. The only remaining bias is from visibility, and the winner is shadow-tested again after the spatial pass.
 - **Denoiser guides:** For pixels that see a mirror, the guides describe the surface *in* the mirror, and its virtual position is reprojected. This keeps reflections stable under camera motion.

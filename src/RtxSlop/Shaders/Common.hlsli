@@ -46,7 +46,9 @@ cbuffer FrameCB : register(b1)
     float gShadowFar;      uint gMeshMaterial;  uint gMeshSdfIndex; uint gGlassFirstIndex;   // gMeshMaterial = NO_MESH without a model
     float3 gMeshSdfMin;    float gSkyIntensity;       // gMeshSdf*: grid of the mesh being baked (SdfBake.hlsl)
     float3 gMeshSdfMax;    uint gAlphaFirstIndex;
-    float gPixelSpread;    uint gBakeFlags;    float2 gPad4;   // pixel spread angle (ray cones), SDF bake: bit 0 = signed
+    float gPixelSpread;    uint gBakeFlags;    uint gLightsIndex;  uint gShadowedLights;   // pixel spread angle (ray cones), SDF bake: bit 0 = signed
+    // gLightsIndex: StructuredBuffer<Light> with gNumLights entries (the first gShadowedLights also get
+    // shadow maps in raster / soft shadows in SDF; gLights[] above is unused legacy)
 };
 
 cbuffer PassCB : register(b2)
@@ -127,9 +129,15 @@ float3 MaterialAlbedoLod(Material m, float3 p, float2 uv, float lod)
     return a;
 }
 
+Light LoadLight(uint li)
+{
+    StructuredBuffer<Light> lights = ResourceDescriptorHeap[gLightsIndex];
+    return lights[li];
+}
+
 float3 LightEmission(uint li)
 {
-    Light L = gLights[li];
+    Light L = LoadLight(li);
     // Radiance of a sphere light that matches a point light of the given intensity: I = Le * pi * r^2
     return L.color * L.intensity / (PI * L.radius * L.radius);
 }
@@ -219,7 +227,7 @@ float3 EvalDiffuseOnly(float3 N, float3 V, float3 L, float3 albedo, float metall
 // Specular lobe is widened by the light's angular size so tiny/glossy highlights stay visible.
 float3 ShadePointLight(uint li, float3 P, float3 N, float3 V, float3 albedo, Material m, bool includeSpec)
 {
-    Light Lt = gLights[li];
+    Light Lt = LoadLight(li);
     float3 Lv = Lt.pos - P;
     float d2 = dot(Lv, Lv);
     float d = sqrt(d2);
@@ -272,6 +280,20 @@ void BuildBasis(float3 n, out float3 t, out float3 b)
 // ---------------------------------------------------------------------------------------------
 // Camera
 // ---------------------------------------------------------------------------------------------
+// ReSTIR DI handles the direct light of rough primary surfaces; glossy / mirror / glass ones keep plain NEE + MIS
+bool RestirEligible(Material m) { return m.type != MAT_GLASS && m.type != MAT_MIRROR && m.roughness >= 0.2; }
+
+// Sub-pixel jitter of a pixel's first path sample. Deterministic per (pixel, frame) so the traced primary
+// G-buffer the ReSTIR passes work on and the path tracer's first sample hit the same surface.
+float2 PrimaryJitter(uint2 id)
+{
+    uint s = PcgHash(id.x * 7919u + PcgHash(id.y * 104729u + PcgHash(gFrameIndex * 31337u + 17u)));
+    float2 j;
+    j.x = Rand(s);
+    j.y = Rand(s);
+    return j;
+}
+
 float3 CameraRayDir(float2 pixel)
 {
     float2 ndc = pixel * gInvScreenSize * float2(2, -2) + float2(-1, 1);
@@ -369,10 +391,10 @@ float TextureLod(Material m, Surface s, float coneWidth, float3 d)
 #define MASK_GLASS    0x08   // static glass objects
 #define MASK_SOLID    (MASK_GEOMETRY | MASK_MESH | MASK_GLASS)
 
-// TLAS instance ids: 0 = static scene, 1..3 = light bulbs, INSTANCE_MESH = the switchable .obj model,
+// TLAS instance ids: 0 = static scene, 1..N = light bulbs, INSTANCE_MESH = the switchable .obj model,
 // INSTANCE_GLASS = static glass objects (own BLAS so shadow rays can treat them separately)
-#define INSTANCE_MESH 100u
-#define INSTANCE_GLASS 101u
+#define INSTANCE_MESH 0x10000u
+#define INSTANCE_GLASS 0x10001u
 #define NO_MESH 0xFFFFFFFFu
 
 bool IsLightInstance(uint id) { return id >= 1 && id < INSTANCE_MESH; }

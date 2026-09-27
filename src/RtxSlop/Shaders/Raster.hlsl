@@ -30,7 +30,7 @@ Vertex FetchVertex(uint vid, out float3 worldPos)
     worldPos = v.pos;
     if (rc1 != NO_LIGHT)
     {
-        Light L = gLights[rc1];
+        Light L = LoadLight(rc1);
         worldPos = L.pos + v.pos * L.radius;
     }
     return v;
@@ -91,7 +91,7 @@ static const float2 kPoisson[12] =
 float ShadowFactor(uint li, float3 P, float3 N, float2 screenPos)
 {
     TextureCubeArray<float> sm = ResourceDescriptorHeap[gShadowIndex];
-    Light Lt = gLights[li];
+    Light Lt = LoadLight(li);
     float3 toLight = Lt.pos - P;
     float3 d = (P + N * 0.02 * sign(dot(N, toLight))) - Lt.pos;
     float3 ad = abs(d);
@@ -150,7 +150,7 @@ float4 PS_Main(VSOut i) : SV_Target
     for (uint li = 0; li < gNumLights; li++)
     {
         float3 c = ShadePointLight(li, i.wpos, N, V, albedo, m, !hasRefl);
-        if (any(c > 0))
+        if (any(c > 0) && li < gShadowedLights)   // only the main lights have shadow maps
             c *= ShadowFactor(li, i.wpos, N, i.pos.xy);
         color += c;
     }

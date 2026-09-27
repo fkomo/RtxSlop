@@ -96,9 +96,10 @@ float3 TracePixel(float2 pixel)
             float3 c = ShadePointLight(li, s.pos, s.N, V, albedo, m, !reflective);
             if (any(c > 0))
             {
-                float3 Lv = gLights[li].pos - P;
+                Light Lt = LoadLight(li);
+                float3 Lv = Lt.pos - P;
                 float dist = length(Lv);
-                direct += c * ShadowTransmittance(P, Lv / dist, dist - gLights[li].radius);
+                direct += c * ShadowTransmittance(P, Lv / dist, dist - Lt.radius);
             }
         }
         direct += AmbientLight(s.N, s.skyVis) * albedo * (1.0 - m.metallic);

@@ -17,6 +17,8 @@ public sealed class RenderSettings
     public bool VSync = false;
     public bool LightsAnimating = true;
     public bool LightsOn = true;           // off: only the sky (Sponza) / ambient (room) lights the scene
+    public bool ManyLights = false;        // + ~128 small drifting lights (where ReSTIR DI pays off)
+    public bool Restir = true;             // ReSTIR DI for the primary hit in the path traced modes
     public bool AntiAliasing = true;   // 4x MSAA (raster) / 4x SSAA (ray tracing)
     public bool SdfAntiAliasing = false;   // 4x SSAA for the SDF marcher (~5x the cost, so off by default)
 }
@@ -40,7 +42,7 @@ public struct FrameData
     public float ShadowFar; public uint MeshMaterial, MeshSdfIndex, GlassFirstIndex;
     public Vector3 MeshSdfMin; public float SkyIntensity;
     public Vector3 MeshSdfMax; public uint AlphaFirstIndex;
-    public float PixelSpread; public uint BakeFlags; public Vector2 Pad4;
+    public float PixelSpread; public uint BakeFlags; public uint LightsIndex, ShadowedLights;
 }
 
 /// <summary>Layout must match PassCB in Common.hlsli.</summary>

@@ -101,7 +101,10 @@ public sealed class Scene
     public readonly List<Material> Materials = new();
     public readonly List<SceneObject> Objects = new();
     public readonly List<Mirror> Mirrors = new();
-    public readonly LightData[] Lights = new LightData[3];
+    // 3 main lights (shadow maps in raster, soft shadows in SDF) + the "many lights" set: small drifting
+    // lights that only light the scene when RenderSettings.ManyLights is on (ReSTIR DI's showcase)
+    public const int MainLights = 3, ExtraLights = 128;
+    public readonly LightData[] Lights = new LightData[MainLights + ExtraLights];
     public readonly List<SdfPrim> SdfPrims = new();
     public readonly List<SdfMesh> SdfMeshes = new();
     public int SdfPlaneCount;        // leading half-space prims (the room only)
@@ -128,7 +131,38 @@ public sealed class Scene
     public float CameraYaw, CameraPitch;
     Action<Scene, float> animateLights;
 
-    public void UpdateLights(float t) => animateLights(this, t);
+    Vector3 extraMin, extraMax;   // box the extra lights drift in
+
+    public void UpdateLights(float t)
+    {
+        animateLights(this, t);
+        var size = extraMax - extraMin;
+        float radius = SkyIntensity > 0 ? 0.06f : 0.04f;
+        float power = SkyIntensity > 0 ? 1.5f : 0.06f;
+        for (int i = 0; i < ExtraLights; i++)
+        {
+            // deterministic per-light parameters from a hash of the index
+            float H(int k) => (uint)(HashCode(i * 16 + k) & 0xFFFFFF) / (float)0x1000000;
+            var home = extraMin + size * new Vector3(H(0), H(1), H(2));
+            var drift = new Vector3(
+                MathF.Sin((0.2f + 0.4f * H(3)) * t + 6.3f * H(4)),
+                0.4f * MathF.Sin((0.3f + 0.5f * H(5)) * t + 6.3f * H(6)),
+                MathF.Sin((0.2f + 0.4f * H(7)) * t + 6.3f * H(8)));
+            var pos = Vector3.Clamp(home + drift * Vector3.Min(size * 0.08f, new Vector3(1.2f)), extraMin, extraMax);
+            // saturated hues
+            float hue = H(9) * 6;
+            var c = new Vector3(Math.Clamp(MathF.Abs(hue - 3) - 1, 0, 1), Math.Clamp(2 - MathF.Abs(hue - 2), 0, 1), Math.Clamp(2 - MathF.Abs(hue - 4), 0, 1));
+            c = Vector3.Lerp(c, Vector3.One, 0.25f);
+            Lights[MainLights + i] = new LightData { Pos = pos, Radius = radius, Color = c, Intensity = power * (0.6f + 0.8f * H(10)) };
+        }
+    }
+
+    static uint HashCode(int v)
+    {
+        uint x = (uint)v * 747796405u + 2891336453u;
+        x = ((x >> (int)((x >> 28) + 4)) ^ x) * 277803737u;
+        return (x >> 22) ^ x;
+    }
 
     public Material SetMeshPreset(int preset)
     {
@@ -168,6 +202,8 @@ public sealed class Scene
             CameraPos = new Vector3(0, 1.7f, -4.6f),
             MeshPresets = ModelPresets(probeSlot),
             animateLights = AnimateRoomLights,
+            extraMin = new Vector3(-HalfX + 0.6f, 0.3f, -HalfZ + 0.6f),
+            extraMax = new Vector3(HalfX - 0.6f, Height - 0.4f, HalfZ - 0.6f),
         };
         int mFloor = s.AddMaterial(new Vector3(0.85f, 0.85f, 0.82f), 0.08f, 0, Material.Checker);
         int mWhite = s.AddMaterial(new Vector3(0.75f, 0.75f, 0.72f), 0.9f, 0);
@@ -309,6 +345,8 @@ public sealed class Scene
             animateLights = AnimateSponzaLights,
             lightCenter = atriumCenter,
             lightSpread = layout.LightSpread,
+            extraMin = atriumCenter + layout.LightSpread * new Vector3(-9.0f, 0.3f, -2.2f),
+            extraMax = atriumCenter + layout.LightSpread * new Vector3(9.0f, 8.0f, 2.2f),
         };
 
         var obj = ObjLoader.Load(objPath);

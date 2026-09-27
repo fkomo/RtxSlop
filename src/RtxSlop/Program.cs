@@ -46,6 +46,7 @@ sealed class MainForm : Form
     readonly string shaderDir = Path.Combine(AppContext.BaseDirectory, "Shaders");
     readonly string captureDir, benchDir;
     HashSet<int> captureScenes = new() { 0, 1, 2, 3, 4 };   // --scenes 1,3 limits the capture script
+    readonly bool restirCapture;                                // --restir: only the many lights / ReSTIR DI comparison
 
     bool mouseCaptured;
     readonly string modelInfo;
@@ -70,6 +71,7 @@ sealed class MainForm : Form
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.Opaque, true);
 
         bool debug = args.Contains("--debug");
+        restirCapture = args.Contains("--restir");
         int ci = Array.IndexOf(args, "--capture");
         if (ci >= 0) captureDir = ci + 1 < args.Length ? args[ci + 1] : "captures";
         int bi = Array.IndexOf(args, "--bench");
@@ -176,7 +178,8 @@ sealed class MainForm : Form
         }
         if (captureDir != null)
         {
-            RunCaptureScript();
+            if (restirCapture) RunRestirCapture();
+            else RunCaptureScript();
             return;
         }
 
@@ -262,6 +265,8 @@ sealed class MainForm : Form
             case Keys.Tab: settings.Mode = (RenderMode)(((int)settings.Mode + 1) % 5); break;
             case Keys.L: settings.LightsAnimating = !settings.LightsAnimating; break;
             case Keys.K: settings.LightsOn = !settings.LightsOn; break;
+            case Keys.J: settings.ManyLights = !settings.ManyLights; break;
+            case Keys.T: settings.Restir = !settings.Restir; break;
             case Keys.F1: SwitchScene(0); break;
             case Keys.F2: SwitchScene(1); break;
             case Keys.F3: SwitchScene(2); break;
@@ -379,6 +384,7 @@ sealed class MainForm : Form
                 g.DrawString(detail, hudFont, Brushes.Gainsboro, 10, y); y += 18;
                 g.DrawString($"{fps,6:F0} fps   cpu {cpuMs,5:F2} ms   gpu {renderer.GpuTimeMs,6:F2} ms   {renderer.Width}x{renderer.Height}", hudFont, Brushes.White, 10, y); y += 18;
                 g.DrawString($"scene {scene.Name} (F1-F5)   lights {(settings.LightsOn ? "on" : "OFF")} (K) {(settings.LightsAnimating ? "moving" : "paused")} (L)", hudFont, Brushes.Gainsboro, 10, y); y += 18;
+                g.DrawString($"many lights {(settings.ManyLights ? $"ON ({scene.Lights.Length})" : "off")} (J)   ReSTIR DI {(settings.Restir ? "on" : "off")} (T, path tracing)", hudFont, Brushes.Gainsboro, 10, y); y += 18;
                 g.DrawString($"exposure {settings.Exposure:F2} ([ ])   vsync {(settings.VSync ? "on" : "off")} (V)", hudFont, Brushes.Gainsboro, 10, y); y += 18;
                 if (scene.HasMesh)
                     g.DrawString($"model {modelInfo}   material {scene.MeshPresets[scene.MeshPreset].Name} (G)", hudFont, Brushes.Gainsboro, 10, y);
@@ -537,6 +543,65 @@ sealed class MainForm : Form
         renderer.Render(camera, settings, lightTime);
 
         return MeasureTimings(allPresets: false);
+    }
+
+    /// <summary>--capture dir --restir: many lights with / without ReSTIR DI (raw 1 spp, moving lights, converged) + timings.</summary>
+    void RunRestirCapture()
+    {
+        showHud = false;
+        renderer.SetHud(DrawHud());
+        var timings = new System.Text.StringBuilder();
+        foreach (var (index, prefix) in new[] { (0, "room"), (1, "sponza"), (2, "dabrovic"), (3, "miguel"), (4, "miguelfull") })
+        {
+            if (!captureScenes.Contains(index)) continue;
+            SwitchScene(index);
+            ResetCamera();
+            settings.ManyLights = true;
+            timings.AppendLine($"== {scene.Name}, {scene.Lights.Length} lights, {renderer.Width}x{renderer.Height}");
+            void Frames(int n, string file, bool animate)
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    Application.DoEvents();
+                    if (animate) { lightTime += 1f / 60; scene.UpdateLights(lightTime); }
+                    if (i == n - 1 && file != null) renderer.RequestCapture(Path.Combine(captureDir, file + ".png"));
+                    renderer.Render(camera, settings, lightTime);
+                }
+            }
+            settings.Mode = RenderMode.Raster;
+            settings.LightsAnimating = false;
+            scene.UpdateLights(lightTime);
+            Frames(3, $"{prefix}_many_0_Raster", false);
+            foreach (var mode in new[] { RenderMode.PathTrace, RenderMode.Hybrid })
+            {
+                foreach (bool restir in new[] { false, true })
+                {
+                    settings.Restir = restir;
+                    string tag = $"{prefix}_many_{(int)mode}_{mode}_{(restir ? "restir" : "nee")}";
+                    // raw: first frame after a reset, no denoiser (history needs a few frames: 8 still-light frames first for ReSTIR)
+                    settings.Denoise = false;
+                    settings.Mode = RenderMode.Raster; Frames(1, null, false);
+                    settings.Mode = mode;
+                    Frames(restir ? 8 : 1, null, false);
+                    settings.Mode = RenderMode.Raster; Frames(1, null, false);
+                    settings.Mode = mode;
+                    Frames(1, tag + "_raw", false);
+                    // moving lights, denoised (what you see when playing)
+                    settings.Denoise = true;
+                    settings.LightsAnimating = true;
+                    float t0 = lightTime;
+                    Frames(60, tag + "_moving", true);
+                    timings.AppendLine($"{mode,-10} {(restir ? "ReSTIR DI" : "NEE (1 random light)"),-22} {renderer.GpuTimeMs,7:F2} ms");
+                    lightTime = t0;
+                    settings.LightsAnimating = false;
+                    scene.UpdateLights(lightTime);
+                    if (mode == RenderMode.PathTrace) Frames(256, tag + "_converged", false);
+                }
+            }
+            settings.Restir = true;
+            settings.ManyLights = false;
+        }
+        File.WriteAllText(Path.Combine(captureDir, "restir-timings.txt"), timings.ToString());
     }
 
     Vector3 ModelCenter() => (scene.MeshMin + scene.MeshMax) * 0.5f;

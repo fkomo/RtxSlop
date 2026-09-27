@@ -450,13 +450,13 @@ public sealed unsafe partial class Renderer
         {
             var L = scene.Lights[i];
             var m = Matrix4x4.CreateScale(L.Radius) * Matrix4x4.CreateTranslation(L.Pos);
-            // switched-off bulbs get mask 0: no ray can hit them
-            inst[n++] = InstanceDesc.Create(m, (uint)(1 + i), lightsOn ? (byte)0x02 : (byte)0, g.BlasSphere.GPUVirtualAddress);
+            // switched-off bulbs (lights off, or the extra lights while "many lights" is off) get mask 0: no ray can hit them
+            inst[n++] = InstanceDesc.Create(m, (uint)(1 + i), i < activeLights ? (byte)0x02 : (byte)0, g.BlasSphere.GPUVirtualAddress);
         }
         if (g.BlasMesh != null)
-            inst[n++] = InstanceDesc.Create(Matrix4x4.Identity, 100, 0x04, g.BlasMesh.GPUVirtualAddress);    // INSTANCE_MESH, MASK_MESH
+            inst[n++] = InstanceDesc.Create(Matrix4x4.Identity, 0x10000, 0x04, g.BlasMesh.GPUVirtualAddress);    // INSTANCE_MESH, MASK_MESH
         if (g.BlasGlass != null)
-            inst[n++] = InstanceDesc.Create(Matrix4x4.Identity, 101, 0x08, g.BlasGlass.GPUVirtualAddress);   // INSTANCE_GLASS, MASK_GLASS
+            inst[n++] = InstanceDesc.Create(Matrix4x4.Identity, 0x10001, 0x08, g.BlasGlass.GPUVirtualAddress);   // INSTANCE_GLASS, MASK_GLASS
         g.TlasInputs.InstanceDescriptions = a.Gpu;
         cl.BuildRaytracingAccelerationStructure(new BuildRaytracingAccelerationStructureDescription
         {

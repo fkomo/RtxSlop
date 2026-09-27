@@ -22,18 +22,20 @@ public sealed unsafe partial class Renderer : IDisposable
     const int ShadowSize = 1024;
     const int ProbeSize = 256;
     const float ShadowNear = 0.05f;
-    const int HudWidth = 560, HudHeight = 234;
+    const int HudWidth = 560, HudHeight = 252;
     const Format HdrFormat = Format.R16G16B16A16_Float;
     const int MsaaSamples = 4;
 
     // Fixed bindless descriptor slots (per-scene resources are allocated from FirstDynamicSlot upwards)
     const int SrvHeapSize = 4096;
-    const int FirstDynamicSlot = 64;
+    const int FirstDynamicSlot = 96;
     const int SlotShadow = 4, SlotProbe = 5, SlotHud = 6, SlotProbe1 = 7;
     const int SlotHdrSrv = 10, SlotHdrUav = 11;
     public const int SlotRefl0 = 12;
     const int SlotPtBase = 20;   // PT textures: srv = base + 2k, uav = base + 2k + 1 (slots 20..39)
     const int SlotGBufPos = 40, SlotGBufNrm = 41, SlotSceneColor = 43;
+    const int SlotLights = 64;   // + frame in flight: the light buffer (a StructuredBuffer view into the upload ring)
+    const int SlotRestir = 68;   // ReSTIR sets k = 0..2 at 68 + 8k: SRVs +0..3 (reservoir A/B, surface A/B), UAVs +4..7
     public static uint ProbeSlot(int i) => (uint)(i == 0 ? SlotProbe : SlotProbe1);
     const Format GBufPosFormat = Format.R32G32B32A32_Float, GBufNrmFormat = Format.R32G32B32A32_Float;
 
@@ -64,7 +66,8 @@ public sealed unsafe partial class Renderer : IDisposable
 
     ID3D12RootSignature rootSig;
     ID3D12PipelineState psoMain, psoMainMsaa, psoMainMirrored, psoShadow, psoTonemap, psoRayTrace, psoPathTrace, psoTemporal, psoAtrous, psoGBuffer, psoSdf,
-        psoGlass, psoGlassMsaa, psoSky, psoSkyMsaa, psoBakeClear, psoBakeSeed, psoBakeJfa, psoBakeFinalize, psoSkyVis;
+        psoGlass, psoGlassMsaa, psoSky, psoSkyMsaa, psoBakeClear, psoBakeSeed, psoBakeJfa, psoBakeFinalize, psoSkyVis,
+        psoRestirInitial, psoRestirSpatial;
 
     readonly List<(int Index, Material Material)> pendingMaterials = new();
 
@@ -81,6 +84,7 @@ public sealed unsafe partial class Renderer : IDisposable
     GpuTexture ptNoisy, ptAlbedo, gbufPos, gbufNrm;
     GpuTexture[] ptGuide = new GpuTexture[2], ptHist = new GpuTexture[2], ptMom = new GpuTexture[2], ptFilt = new GpuTexture[2];
     CpuDescriptorHandle[] backBufferRtvs = new CpuDescriptorHandle[BackBufferCount];
+    GpuTexture[,] restir = new GpuTexture[3, 4];   // [set, reservoir A / reservoir B / surface A / surface B]; sets 0/1 ping-pong, 2 = temporary
 
     // timing
     ID3D12QueryHeap queryHeap;
@@ -91,6 +95,8 @@ public sealed unsafe partial class Renderer : IDisposable
     Matrix4x4 prevViewProj;
     Vector3 prevCamPos;
     bool historyValid;
+    int activeLights, lastActiveLights = -1;
+    ulong restirFrame = ulong.MaxValue;   // last frame that ran the ReSTIR passes (their history)
     RenderMode lastMode = (RenderMode)(-1);
     byte[] pendingHud;
     string pendingCapture;
@@ -181,14 +187,14 @@ public sealed unsafe partial class Renderer : IDisposable
     CpuDescriptorHandle AllocRtv() => rtvHeap.GetCPUDescriptorHandleForHeapStart() + (int)(nextRtv++ * rtvInc);
     CpuDescriptorHandle AllocDsv() => dsvHeap.GetCPUDescriptorHandleForHeapStart() + (int)(nextDsv++ * dsvInc);
 
-    void CreateStructuredSrv(ID3D12Resource res, int slot, int count, int stride)
+    void CreateStructuredSrv(ID3D12Resource res, int slot, int count, int stride, ulong first = 0)
     {
         device.CreateShaderResourceView(res, new ShaderResourceViewDescription
         {
             Format = Format.Unknown,
             ViewDimension = ShaderResourceViewDimension.Buffer,
             Shader4ComponentMapping = ShaderComponentMapping.Default,
-            Buffer = new BufferShaderResourceView { FirstElement = 0, NumElements = (uint)count, StructureByteStride = (uint)stride },
+            Buffer = new BufferShaderResourceView { FirstElement = first, NumElements = (uint)count, StructureByteStride = (uint)stride },
         }, SrvCpu(slot));
     }
 
@@ -373,6 +379,17 @@ public sealed unsafe partial class Renderer : IDisposable
         device.CreateRenderTargetView(gbufNrm.Resource, null, gbufNrm.Rtv);
         CreateTexSrv(gbufNrm, SlotGBufNrm, GBufNrmFormat);
 
+        // ReSTIR DI reservoirs + the surfaces they belong to (the temporary set needs no surfaces)
+        for (int set = 0; set < 3; set++)
+            for (int j = 0; j < (set == 2 ? 2 : 4); j++)
+            {
+                var fmt = j == 1 ? Format.R32G32_Float : Format.R32G32B32A32_Float;
+                var t = CreateTexture($"ReSTIR {set}.{j}", fmt, Width, Height, 1, ResourceFlags.AllowUnorderedAccess, ResourceStates.AllShaderResource);
+                CreateTexSrv(t, SlotRestir + 8 * set + j, fmt);
+                CreateTexUav(t, SlotRestir + 8 * set + 4 + j, fmt);
+                restir[set, j] = t;
+            }
+
         historyValid = false;
     }
 
@@ -384,6 +401,7 @@ public sealed unsafe partial class Renderer : IDisposable
         ptNoisy?.Dispose(); ptAlbedo?.Dispose(); gbufPos?.Dispose(); gbufNrm?.Dispose();
         foreach (var arr in new[] { ptGuide, ptHist, ptMom, ptFilt })
             foreach (var t in arr) t?.Dispose();
+        foreach (var t in restir) t?.Dispose();
     }
 
     public void Resize(int width, int height)
@@ -438,6 +456,7 @@ public sealed unsafe partial class Renderer : IDisposable
             ("Denoise.hlsl", "CS_Temporal", "cs_6_6"), ("Denoise.hlsl", "CS_Atrous", "cs_6_6"), ("Sdf.hlsl", "CS_Sdf", "cs_6_6"),
             ("SdfBake.hlsl", "CS_SdfClear", "cs_6_6"), ("SdfBake.hlsl", "CS_SdfSeed", "cs_6_6"), ("SdfBake.hlsl", "CS_SdfJfa", "cs_6_6"),
             ("SdfBake.hlsl", "CS_SdfFinalize", "cs_6_6"), ("SceneBake.hlsl", "CS_SkyVisibility", "cs_6_6"),
+            ("Restir.hlsl", "CS_RestirInitial", "cs_6_6"), ("Restir.hlsl", "CS_RestirSpatial", "cs_6_6"),
         };
         var code = new byte[jobs.Length][];
         Parallel.For(0, jobs.Length, i => code[i] = Compile(dir, jobs[i].File, jobs[i].Entry, jobs[i].Profile));
@@ -492,6 +511,8 @@ public sealed unsafe partial class Renderer : IDisposable
         psoBakeJfa = Cs("CS_SdfJfa");
         psoBakeFinalize = Cs("CS_SdfFinalize");
         psoSkyVis = Cs("CS_SkyVisibility");
+        psoRestirInitial = Cs("CS_RestirInitial");
+        psoRestirSpatial = Cs("CS_RestirSpatial");
     }
 
     // BlendDescription.Opaque only fills RenderTarget[0]; MRT pipelines need every slot valid.
@@ -505,7 +526,7 @@ public sealed unsafe partial class Renderer : IDisposable
     void DisposePipelines()
     {
         foreach (var p in new IDisposable[] { psoMain, psoMainMsaa, psoMainMirrored, psoShadow, psoTonemap, psoRayTrace, psoPathTrace, psoTemporal, psoAtrous, psoGBuffer, psoSdf,
-            psoGlass, psoGlassMsaa, psoSky, psoSkyMsaa, psoBakeClear, psoBakeSeed, psoBakeJfa, psoBakeFinalize, psoSkyVis, rootSig })
+            psoGlass, psoGlassMsaa, psoSky, psoSkyMsaa, psoBakeClear, psoBakeSeed, psoBakeJfa, psoBakeFinalize, psoSkyVis, psoRestirInitial, psoRestirSpatial, rootSig })
             p?.Dispose();
     }
 
@@ -571,9 +592,15 @@ public sealed unsafe partial class Renderer : IDisposable
         var proj = Matrix4x4.CreatePerspectiveFieldOfViewLeftHanded(camera.FovY, aspect, 0.05f, 200f);
         var viewProj = view * proj;
         Matrix4x4.Invert(viewProj, out var invViewProj);
-        if (lastMode != s.Mode) historyValid = false;
+        // the lights that shine this frame: none, the 3 main ones, or all of them
+        activeLights = s.LightsOn ? (s.ManyLights ? scene.Lights.Length : Scene.MainLights) : 0;
+        if (lastMode != s.Mode || activeLights != lastActiveLights) historyValid = false;
         if (!historyValid) { prevViewProj = viewProj; prevCamPos = camera.Position; }
         bool pathTraced = s.Mode is RenderMode.PathTrace or RenderMode.Hybrid;
+
+        var lightsAlloc = ring.Alloc((ulong)(Math.Max(1, activeLights) * sizeof(LightData)), (ulong)sizeof(LightData));
+        for (int i = 0; i < activeLights; i++) ((LightData*)lightsAlloc.Cpu)[i] = scene.Lights[i];
+        CreateStructuredSrv(ring.Buffer, SlotLights + fi, Math.Max(1, activeLights), sizeof(LightData), lightsAlloc.Offset / (ulong)sizeof(LightData));
 
         var fd = new FrameData
         {
@@ -586,7 +613,9 @@ public sealed unsafe partial class Renderer : IDisposable
             FrameIndex = (uint)frameCounter,
             ScreenSize = new Vector2(Width, Height),
             InvScreenSize = new Vector2(1f / Width, 1f / Height),
-            NumLights = s.LightsOn ? (uint)scene.Lights.Length : 0,
+            NumLights = (uint)activeLights,
+            LightsIndex = (uint)(SlotLights + fi),
+            ShadowedLights = (uint)Math.Min(activeLights, Scene.MainLights),
             MaxBounces = (uint)(pathTraced ? s.PtBounces : s.RtBounces),
             Spp = (uint)s.Spp,
             Ambient = pathTraced ? Vector3.Zero : scene.Ambient,
@@ -693,6 +722,7 @@ public sealed unsafe partial class Renderer : IDisposable
         prevCamPos = camera.Position;
         historyValid = true;
         lastMode = s.Mode;
+        lastActiveLights = activeLights;
         frameCounter++;
     }
 
@@ -748,7 +778,7 @@ public sealed unsafe partial class Renderer : IDisposable
         }
         if (lightBulbs)
         {
-            for (int i = 0; i < scene.Lights.Length; i++)
+            for (int i = 0; i < activeLights; i++)
             {
                 RootConstants(false, (uint)scene.SphereFirstIndex, (uint)i);
                 cl.DrawInstanced((uint)scene.SphereIndexCount, 1, 0, 0);
@@ -775,7 +805,7 @@ public sealed unsafe partial class Renderer : IDisposable
             Transition(shadowMap, ResourceStates.DepthWrite);
             cl.SetPipelineState(psoShadow);
             SetViewport(ShadowSize, ShadowSize);
-            for (int l = 0; l < scene.Lights.Length; l++)
+            for (int l = 0; l < Math.Min(activeLights, Scene.MainLights); l++)
             {
                 var lp = scene.Lights[l].Pos;
                 for (int f = 0; f < 6; f++)
@@ -901,9 +931,40 @@ public sealed unsafe partial class Renderer : IDisposable
         Transition(ptNoisy, ResourceStates.UnorderedAccess);
         Transition(ptGuide[cur], ResourceStates.UnorderedAccess);
         Transition(ptAlbedo, ResourceStates.UnorderedAccess);
+        uint gPos = hybrid ? (uint)gbufPos.Srv : 0xFFFFFFFFu, gNrm = hybrid ? (uint)gbufNrm.Srv : 0xFFFFFFFFu;
+
+        // ReSTIR DI: initial candidates + temporal reuse -> set 2, spatial reuse -> set cur (read by the path tracer)
+        bool useRestir = s.Restir && activeLights > 0;
+        uint setCur = (uint)(SlotRestir + 8 * cur), setPrev = (uint)(SlotRestir + 8 * prev), setTmp = SlotRestir + 16;
+        if (useRestir)
+        {
+            for (int j = 0; j < 4; j++)
+            {
+                Transition(restir[cur, j], ResourceStates.UnorderedAccess);
+                Transition(restir[prev, j], ResourceStates.AllShaderResource);
+            }
+            Transition(restir[2, 0], ResourceStates.UnorderedAccess);
+            Transition(restir[2, 1], ResourceStates.UnorderedAccess);
+            cl.SetPipelineState(psoRestirInitial);
+            bool restirHistory = historyValid && restirFrame == frameCounter - 1;
+            restirFrame = frameCounter;
+            RootConstants(true, setCur, setPrev, setTmp, gPos, gNrm, restirHistory ? 0u : 1u);
+            Dispatch2D();
+            Transition(restir[2, 0], ResourceStates.AllShaderResource);
+            Transition(restir[2, 1], ResourceStates.AllShaderResource);
+            Transition(restir[cur, 2], ResourceStates.AllShaderResource);
+            Transition(restir[cur, 3], ResourceStates.AllShaderResource);
+            cl.SetPipelineState(psoRestirSpatial);
+            RootConstants(true, setCur, setPrev, setTmp);
+            Dispatch2D();
+            Transition(restir[cur, 0], ResourceStates.AllShaderResource);
+            Transition(restir[cur, 1], ResourceStates.AllShaderResource);
+        }
+
+        // rc7: 0 = PT, 1 = PT + ReSTIR, 2 = hybrid + ReSTIR, 3 = hybrid
+        uint ptMode = hybrid ? (useRestir ? 2u : 3u) : (useRestir ? 1u : 0u);
         cl.SetPipelineState(psoPathTrace);
-        RootConstants(true, (uint)ptNoisy.Uav, (uint)ptGuide[cur].Uav, (uint)ptAlbedo.Uav,
-            hybrid ? (uint)gbufPos.Srv : 0xFFFFFFFFu, hybrid ? (uint)gbufNrm.Srv : 0xFFFFFFFFu);
+        RootConstants(true, (uint)ptNoisy.Uav, (uint)ptGuide[cur].Uav, (uint)ptAlbedo.Uav, gPos, gNrm, setCur, setCur + 1, ptMode);
         Dispatch2D();
 
         // temporal accumulation
